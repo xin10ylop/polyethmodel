@@ -103,7 +103,7 @@ def robustness(cfg, label=""):
 
 
 CFG_A = {"kind": "A", "decision_offset": -45, "fill_by": -45, "entry_price": 0.50, "stack_cols": ["m2_-45_close_p", "bm_-45_close_p", "bp_-60_z_s5"],
-         "thr": 0.05, "tp": 0.85, "sl": None, "tstop": None, "settle": True}   # adopted 2026-11-04: TP 0.85 then hold to settlement (research/settle_exit_A.py); live rule in final_report_data.py / paper_trader.py
+         "thr": 0.05, "tp": 0.80, "sl": None, "tstop": None, "settle": True}   # ETH 2026-11-09: sell 0.80 then hold to settlement, selected on tune (research/settle_exit_A.py, research/eth_A_confirm.py); live rule in final_report_data.py / paper_trader.py
 CFG_B = {"kind": "B", "decision_offset": 0, "cancel": 10, "delta": 0.12, "tp": 0.85, "sl": None, "tstop": None, "settle": True}   # adopted 2026-11-04: sell 0.85 else settle (research/ideas10.py)
 CFG_B0 = {"kind": "B", "decision_offset": 0, "cancel": 10, "delta": 0.12, "tp": 0.80, "sl": 0.10, "tstop": 240}                    # previous exits (shadow)
 CFG_D = {"kind": "D", "decision_offset": 90, "cancel": 10, "q": 0.90, "maxpx": 0.90, "minpx": 0.80, "tp": None, "sl": None, "tstop": None, "settle": True}   # high-confidence settlement capture; minpx 0.80 added 2026-11-06 (research/d_winrate.py: +1 to +5 points of win rate in all five periods)

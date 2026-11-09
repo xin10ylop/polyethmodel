@@ -14,7 +14,7 @@ mk, g = polysim.load_windows(days=days)
 def sim_for(t_entry, tp):
     sim = polysim.simulate(mk, g, t_entry=t_entry, entry_mode="fixed", pe=0.50, tps=(tp if tp else 1.01,), sls=(0.0,), tstops=(300,), slip=0.01); idx = np.arange(len(sim["W"]))
     for sd in (0, 1):
-        k = sim["kind"][idx, sd, 0, 0, 0]; sim["pnl"][idx, sd, 0, 0, 0] = np.where((k == 0) & (tp is not None), tp - 0.5, sim["settle"][idx, sd])
+        k = sim["kind"][idx, sd, 0, 0, 0]; sim["pnl"][idx, sd, 0, 0, 0] = np.where((k == 0) & (tp is not None), (tp or 0.0) - 0.5, sim["settle"][idx, sd])
     return pd.DataFrame({"T": sim["W"], "pnl_up": sim["pnl"][idx, 0, 0, 0, 0], "pnl_dn": sim["pnl"][idx, 1, 0, 0, 0]}).set_index("T")
 SIMS = {("-45", 0.85): sim_for(-45, 0.85), ("-45", None): sim_for(-45, None), ("-60", 0.85): sim_for(-60, 0.85), ("-30", 0.85): sim_for(-30, 0.85)}
 rows = []
