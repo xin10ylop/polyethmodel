@@ -23,15 +23,17 @@ def get(url, retries=6):
         except Exception as e:
             last = e; time.sleep(2 ** k)
     raise RuntimeError(f"{url}: {last}")
+KEEP_RAW = os.environ.get("KEEP_RAW", "1") == "1"      # KEEP_RAW=0: day files only (long history on a small disk)
 def load_raw(kind, url, d):
     p = f"{RAW}/{kind}/{d}.zip"
     if os.path.exists(p): return open(p, "rb").read()
     blob = get(url)
     if blob is None: return None
-    open(p + ".part", "wb").write(blob); os.replace(p + ".part", p); return blob
+    if KEEP_RAW: open(p + ".part", "wb").write(blob); os.replace(p + ".part", p)
+    return blob
 def do_day(d):
     out = f"{DAYS}/{d}.npz"
-    if os.path.exists(out) and os.path.exists(f"{RAW}/spot1s/{d}.zip") and os.path.exists(f"{RAW}/umagg/{d}.zip"): return f"{d}: cached"
+    if os.path.exists(out) and (not KEEP_RAW or (os.path.exists(f"{RAW}/spot1s/{d}.zip") and os.path.exists(f"{RAW}/umagg/{d}.zip"))): return f"{d}: cached"
     spot = load_raw("spot1s", f"{BASE}/spot/daily/klines/{SYM}/1s/{SYM}-1s-{d}.zip", d)
     if spot is None: return f"{d}: spot missing"
     um = load_raw("umagg", f"{BASE}/futures/um/daily/aggTrades/{SYM}/{SYM}-aggTrades-{d}.zip", d)
