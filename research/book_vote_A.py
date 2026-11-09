@@ -8,10 +8,7 @@ warnings.filterwarnings("ignore"); pd.set_option("display.width", 250)
 sys.path.insert(0, "/home/user/polyethmodel/polyeth"); import polysim  # noqa: E402
 EXTRA = "/home/user/data_eth/extra"; LAT = 47; OUT = "/home/user/polyethmodel/reports"
 HEADS = ["m2_-45_close_p", "bp_-60_z_s5"]
-SRC = [("Jun", "/home/user/data_eth/master_june.parquet", "/home/user/data_eth/polymarket/markets_2026-06-01_2026-07-01.parquet"),
-       ("Jul", "/home/user/data_eth/master_july_L0.parquet", "/home/user/data_eth/polymarket/markets_2026-07-01_2026-08-01.parquet"),
-       ("main", "/home/user/data_eth/master.parquet", "/home/user/data_eth/polymarket/markets.parquet"),
-       ("Nov", "/home/user/data_eth/master_nov.parquet", "/home/user/data_eth/polymarket/markets_nov.parquet")]
+SRC = [("all", "/home/user/data_eth/master.parquet", "/home/user/data_eth/polymarket/markets.parquet")]
 parts = [pd.read_parquet(mp, columns=["date", "up"] + HEADS) for _, mp, _ in SRC]
 W = pd.concat(parts); W = W[~W.index.duplicated(keep="last")].sort_index(); W["date"] = pd.to_datetime(W.date)
 T = W.index.values.astype(np.int64)
@@ -34,9 +31,9 @@ def period_sim(markets, days):
     for sd in (0, 1):
         k = sim["kind"][idx, sd, 0, 0, 0]; sim["pnl"][idx, sd, 0, 0, 0] = np.where(k == 0, 0.35, sim["settle"][idx, sd])
     return pd.DataFrame({"T": sim["W"], "pnl_up": sim["pnl"][idx, 0, 0, 0, 0], "pnl_dn": sim["pnl"][idx, 1, 0, 0, 0]}).set_index("T")
-PER = {"Jun": (SRC[0][2], [f"2026-06-{d:02d}" for d in range(1, 31)]), "Jul": (SRC[1][2], [f"2026-07-{d:02d}" for d in range(1, 32)]),
-       "tune": (SRC[2][2], [str(d.date()) for d in pd.date_range("2026-08-20", "2026-09-30")]), "test": (SRC[2][2], [str(d.date()) for d in pd.date_range("2026-10-01", "2026-11-03")]),
-       "Nov4-7": (SRC[3][2], [f"2026-11-{d:02d}" for d in range(4, 8)])}
+PER = {"Jun": (SRC[0][2], [f"2026-06-{d:02d}" for d in range(1, 31)]), "Jul": (SRC[0][2], [f"2026-07-{d:02d}" for d in range(1, 32)]),
+       "tune": (SRC[0][2], [str(d.date()) for d in pd.date_range("2026-08-20", "2026-09-30")]), "test": (SRC[0][2], [str(d.date()) for d in pd.date_range("2026-10-01", "2026-11-03")]),
+       "Nov4-7": (SRC[0][2], [f"2026-11-{d:02d}" for d in range(4, 8)])}
 SIM = {k: period_sim(*v) for k, v in PER.items()}
 p = W["m2_-45_close_p"].values; z5 = W["bp_-60_z_s5"].values; up = W.up.values == 1; sideup = p > 0.5
 rows = []

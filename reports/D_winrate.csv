@@ -1,0 +1,37 @@
+variant,period,n,per_day,entry,win,cents,usd_day,worst,maxdd
+"0. D as it runs (T+90, q .90, px <= .90)",Aug1-19,96,5.1,0.862,0.854,-0.82,-6.0,-237.0,445.0
+"0. D as it runs (T+90, q .90, px <= .90)",tune,254,6.0,0.873,0.85,-2.25,-15.0,-377.0,1158.0
+"0. D as it runs (T+90, q .90, px <= .90)",test,130,3.8,0.868,0.862,-0.66,-2.0,-130.0,493.0
+1. later: T+150,Aug1-19,130,6.8,0.864,0.9,3.63,25.0,-188.0,396.0
+1. later: T+150,tune,270,6.4,0.861,0.881,2.02,15.0,-205.0,456.0
+1. later: T+150,test,164,4.8,0.862,0.86,-0.2,4.0,-299.0,428.0
+2. later: T+180,Aug1-19,150,7.9,0.853,0.88,2.73,17.0,-254.0,300.0
+2. later: T+180,tune,245,5.8,0.863,0.857,-0.58,2.0,-313.0,834.0
+2. later: T+180,test,159,4.7,0.864,0.868,0.41,2.0,-147.0,571.0
+3. stricter model: q .95,Aug1-19,4,,,,,,,
+3. stricter model: q .95,tune,13,0.3,0.884,0.769,-11.47,-4.0,-100.0,259.0
+3. stricter model: q .95,test,9,0.3,0.85,0.667,-18.33,-5.0,-100.0,200.0
+"4. market agrees too: side trades in [.80, .90]",Aug1-19,87,4.6,0.872,0.874,0.16,1.0,-141.0,342.0
+"4. market agrees too: side trades in [.80, .90]",tune,245,5.8,0.877,0.853,-2.38,-15.0,-377.0,1183.0
+"4. market agrees too: side trades in [.80, .90]",test,122,3.6,0.876,0.861,-1.49,-6.0,-138.0,556.0
+5. short heads agree: 60 s head >= .80 for our side,Aug1-19,96,5.1,0.862,0.854,-0.82,-6.0,-237.0,445.0
+5. short heads agree: 60 s head >= .80 for our side,tune,254,6.0,0.873,0.85,-2.25,-15.0,-377.0,1158.0
+5. short heads agree: 60 s head >= .80 for our side,test,130,3.8,0.868,0.862,-0.66,-2.0,-130.0,493.0
+6. price well past the reference: |move| >= 10 bp our way,Aug1-19,35,1.8,0.863,0.857,-0.63,-1.0,-100.0,225.0
+6. price well past the reference: |move| >= 10 bp our way,tune,203,4.8,0.872,0.867,-0.52,-2.0,-377.0,568.0
+6. price well past the reference: |move| >= 10 bp our way,test,84,2.5,0.868,0.845,-2.28,-5.0,-155.0,441.0
+7. calm window: 5-min vol below the tune median,Aug1-19,78,4.1,0.867,0.859,-0.77,-5.0,-237.0,383.0
+7. calm window: 5-min vol below the tune median,tune,91,2.2,0.877,0.857,-1.97,-5.0,-274.0,469.0
+7. calm window: 5-min vol below the tune median,test,75,2.2,0.872,0.893,2.17,6.0,-100.0,274.0
+8. no path crossings: touch-back probability <= .15,Aug1-19,96,5.1,0.862,0.854,-0.82,-6.0,-237.0,445.0
+8. no path crossings: touch-back probability <= .15,tune,253,6.0,0.873,0.85,-2.35,-16.0,-377.0,1188.0
+8. no path crossings: touch-back probability <= .15,test,130,3.8,0.868,0.862,-0.66,-2.0,-130.0,493.0
+9. model very sure of the direction now: 10 s head >= .90,Aug1-19,96,5.1,0.862,0.854,-0.82,-6.0,-237.0,445.0
+9. model very sure of the direction now: 10 s head >= .90,tune,254,6.0,0.873,0.85,-2.25,-15.0,-377.0,1158.0
+9. model very sure of the direction now: 10 s head >= .90,test,130,3.8,0.868,0.862,-0.66,-2.0,-130.0,493.0
+"10. combo: T+150, q .92, side in [.80, .90]",Aug1-19,63,3.3,0.873,0.952,7.89,30.0,-70.0,70.0
+"10. combo: T+150, q .92, side in [.80, .90]",tune,110,2.6,0.88,0.882,0.17,1.0,-200.0,448.0
+"10. combo: T+150, q .92, side in [.80, .90]",test,72,2.1,0.88,0.875,-0.47,-1.0,-247.0,247.0
+"11. combo: T+90, q .90, |move| >= 10 bp, 60 s head >= .80",Aug1-19,35,1.8,0.863,0.857,-0.63,-1.0,-100.0,225.0
+"11. combo: T+90, q .90, |move| >= 10 bp, 60 s head >= .80",tune,203,4.8,0.872,0.867,-0.52,-2.0,-377.0,568.0
+"11. combo: T+90, q .90, |move| >= 10 bp, 60 s head >= .80",test,84,2.5,0.868,0.845,-2.28,-5.0,-155.0,441.0

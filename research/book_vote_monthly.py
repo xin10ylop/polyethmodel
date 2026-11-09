@@ -2,10 +2,7 @@
 import sys, warnings, numpy as np, pandas as pd
 warnings.filterwarnings("ignore"); pd.set_option("display.width", 200)
 sys.path.insert(0, "/home/user/polyethmodel/polyeth"); import polysim, bookdepth  # noqa: E402
-SRC = [("/home/user/data_eth/master_june.parquet", "/home/user/data_eth/polymarket/markets_2026-06-01_2026-07-01.parquet", [f"2026-06-{d:02d}" for d in range(1, 31)]),
-       ("/home/user/data_eth/master_july_L0.parquet", "/home/user/data_eth/polymarket/markets_2026-07-01_2026-08-01.parquet", [f"2026-07-{d:02d}" for d in range(1, 32)]),
-       ("/home/user/data_eth/master.parquet", "/home/user/data_eth/polymarket/markets.parquet", [str(d.date()) for d in pd.date_range("2026-08-01", "2026-11-03")]),
-       ("/home/user/data_eth/master_nov.parquet", "/home/user/data_eth/polymarket/markets_nov.parquet", [f"2026-11-{d:02d}" for d in range(4, 8)])]
+SRC = [("/home/user/data_eth/master.parquet", "/home/user/data_eth/polymarket/markets.parquet", [str(d.date()) for d in pd.date_range("2026-06-01", "2026-11-08")])]
 W = pd.concat([pd.read_parquet(mp, columns=["date", "up", "m2_-45_close_p", "bp_-60_z_s5"]) for mp, _, _ in SRC]); W = W[~W.index.duplicated(keep="last")].sort_index()
 W["date"] = pd.to_datetime(W.date); p = W["m2_-45_close_p"].values; z5 = W["bp_-60_z_s5"].values
 b = bookdepth.archive_imbalance(W.index.values.astype(np.int64))
