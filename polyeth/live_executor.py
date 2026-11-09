@@ -25,9 +25,10 @@ MAX_OPEN = int(os.environ.get("MAX_OPEN", "4"))
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "-100"))
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 ALLOW_TAKER = os.environ.get("ALLOW_TAKER", "0") == "1"   # default: post-only everywhere, a fee can never be paid
-PAPER = os.environ.get("PAPER_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper")
+CANCEL_ALL = os.environ.get("CANCEL_ALL_ON_START", "0") == "1"   # 1: wipe every resting order of the account at start / stop (only when no other bot shares the wallet)
+PAPER = os.environ.get("PAPER_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper_eth")
 STOP_FILE = os.path.join(PAPER, "STOP")
-CFG_TP = {"A": 0.85, "B": 0.85, "D": None}   # sell limit per strategy (mirrors paper_trader CFG_*; used only when re-posting after a restart)
+CFG_TP = {"A": 0.80, "B": 0.85, "D": None}   # sell limit per strategy (mirrors paper_trader CFG_*; used only when re-posting after a restart)
 LOG = open(os.path.join(PAPER, "live.log"), "a")
 
 
@@ -84,7 +85,7 @@ class SDK:
 
 class LiveExecutor:
     def __init__(self):
-        self.sdk = SDK(); self.lock = threading.Lock()
+        self.sdk = SDK(); self.lock = threading.RLock()      # re-entrant: the SIGTERM handler runs in the main thread, which may already hold it inside poll()
         self.orders = {}          # order_id -> dict(strategy, T, side, token, price, size, kind buy|sell, cancel_at, filled, cancel_sent, err)
         self.positions = {}       # (strategy, T) -> dict(side, token, cond, size, entry, sell_orders, resting, sold, pnl, settled, redeemed, next_check)
         self.day = None; self.day_pnl = 0.0; self.halted = False
@@ -93,15 +94,16 @@ class LiveExecutor:
         log(f"executor up: stake ${STAKE_USD}, max open {MAX_OPEN}, daily loss limit ${DAILY_LOSS_LIMIT}, dry_run={DRY_RUN}")
         if not DRY_RUN:
             if not os.environ.get("POLYMARKET_RELAYER_API_KEY"): log("WARNING: no POLYMARKET_RELAYER_API_KEY: winning positions held to settlement will NOT be redeemed automatically")
-            try: self.sdk.cancel_all(); log("startup: cancelled every resting order left by a previous run (a bid filled while the trader was down is NOT known here: check the Polymarket UI after an unplanned restart)")
-            except Exception as e: log(f"startup cancel_all FAILED: {repr(e)[:120]} - check the Polymarket UI for resting orders")
+            if CANCEL_ALL:
+                try: self.sdk.cancel_all(); log("startup: cancelled every resting order of the account (CANCEL_ALL_ON_START=1)")
+                except Exception as e: log(f"startup cancel_all FAILED: {repr(e)[:120]} - check the Polymarket UI for resting orders")
         self._load_state()
 
     # ---------------------------------------------------------------- persistence (a restart must not forget shares it holds or the day's loss)
     def _save_state(self):
         try:
             tmp = self.pos_file + ".tmp"
-            json.dump({"day": self.day, "day_pnl": self.day_pnl, "halted": self.halted, "redeem_q": self.redeem_q,
+            json.dump({"day": self.day, "day_pnl": self.day_pnl, "halted": self.halted, "redeem_q": self.redeem_q, "orders": self.orders,
                        "positions": {f"{k[0]}|{k[1]}": p for k, p in self.positions.items() if not (p["settled"] and p.get("redeemed", True))}}, open(tmp, "w")); os.replace(tmp, self.pos_file)
         except Exception as e: log(f"save state failed: {repr(e)[:100]}")
 
@@ -114,8 +116,28 @@ class LiveExecutor:
             self.day, self.day_pnl, self.halted = today, float(saved.get("day_pnl", 0.0)), bool(saved.get("halted", False))
             log(f"restored today's realised P&L {self.day_pnl:+.2f}" + (" (daily loss limit already reached: no new trades today)" if self.halted else ""))
         self.redeem_q = list(saved.get("redeem_q", [])); now = time.time()
+        # orders this bot left on the book (crash / restart): cancel exactly those (another bot may share the wallet), keep the BUYs tracked so that
+        # a fill that happened while the bot was down is picked up by poll() and booked; the SELLs are re-posted below for the positions still open
+        for oid, o in (saved.get("orders") or {}).items():
+            if DRY_RUN: continue
+            try: self.sdk.cancel(oid)
+            except Exception as e: log(f"startup: cancel of own order {oid} failed ({repr(e)[:80]})")
+            if o.get("kind") == "buy": o["cancel_sent"] = True; o["cancel_at"] = 0; self.orders[oid] = o
+        sold_adj = {}
+        for oid, o in (saved.get("orders") or {}).items():          # a take-profit that filled while the bot was down: book it on the restored position
+            if DRY_RUN or o.get("kind") != "sell": continue
+            try:
+                _, matched = self.sdk.status(oid); new = float(matched) - float(o.get("filled", 0.0))
+                if new > 1e-9: k = f"{o['strategy']}|{o['T']}"; sold_adj[k] = sold_adj.get(k, 0.0) + new; sold_adj[k + "|px"] = o["price"]
+            except Exception as e: log(f"startup: status of own sell {oid} failed ({repr(e)[:80]}) - if it filled while the bot was down the tally is off by that sale")
+        if saved.get("orders"): log(f"startup: cancelled {len(saved['orders'])} order(s) left by the previous run; {len(self.orders)} buy(s) kept under watch for fills made while the bot was down")
         for key, p in saved.get("positions", {}).items():
-            st, T = key.split("|"); T = int(T); p["sell_orders"] = []; p["resting"] = 0.0; p["next_check"] = 0.0; p.setdefault("redeemed", True)
+            st, T = key.split("|"); T = int(T); p["sell_orders"] = []; p["resting"] = 0.0; p["next_check"] = 0.0; p.setdefault("redeemed", True); p.setdefault("tp", CFG_TP.get(st)); p["next_sell_try"] = 0.0
+            if key in sold_adj:
+                new = sold_adj[key]; pnl = (sold_adj[key + "|px"] - p["entry"]) * new; p["sold"] += new; p["pnl"] += pnl; self._book(pnl)
+                self._rec(self.ft, event="fill", strategy=st, T=T, side=p["side"], price=sold_adj[key + "|px"], size=new, kind="sell", fee=0.0, pnl=round(pnl, 4), note="filled while the bot was down")
+                log(f"[{st}] take-profit filled while the bot was down: SOLD @{sold_adj[key + '|px']:.2f} x{new:.2f} pnl {pnl:+.2f}")
+                if p["sold"] >= p["size"] - 1e-6: p["settled"] = True
             self.positions[(st, T)] = p; held = p["size"] - p["sold"]
             if p["settled"]: continue
             log(f"[{st}] restored position from a previous run: {p['side']} x{held:.2f} @{p['entry']:.2f} (window {dt.datetime.fromtimestamp(T, dt.UTC):%H:%M})")
@@ -176,6 +198,8 @@ class LiveExecutor:
         """Rest a BUY limit for `strategy` on `side` at `price`; cancel at epoch `cancel_at` if unfilled; sell limit `tp` after the fill (None = hold)."""
         with self.lock:
             if not self._can_open(strategy): return None
+            if cancel_at is not None and time.time() > cancel_at - 1.0:
+                log(f"[{strategy}] BUY {side} NOT placed: {cancel_at - time.time():+.1f}s to its cancel time (decision came too late)"); self._rec(self.fo, event="late", strategy=strategy, T=T, side=side); return None
             token = token_up if side == "UP" else token_down; size = self._size(price); price = self._floor2(price)   # never bid above the print
             try:
                 r, taker = self._place(token, "BUY", price, size)
@@ -184,7 +208,7 @@ class LiveExecutor:
             oid = r["order_id"]; self.orders[oid] = dict(strategy=strategy, T=T, side=side, token=token, cond=condition_id, price=price, size=size, kind="buy", cancel_at=cancel_at, filled=0.0, tp=tp, placed=time.time(), taker=taker)
             self._rec(self.fo, event="placed", order_id=oid, strategy=strategy, T=T, side=side, price=price, size=size, kind="buy", status=r.get("status"), taker=taker)
             log(f"[{strategy}] BUY {side} @{price:.2f} x{size} order {oid} status {r.get('status')}{' TAKER' if taker else ''}")
-            return oid
+            self._save_state(); return oid
 
     def _post_sell(self, st, T, p, tp):
         """Rest a SELL limit at tp for the shares held that are not yet sold or resting; floors to 2 decimals and respects the
@@ -198,8 +222,10 @@ class LiveExecutor:
             self.orders[r["order_id"]] = dict(strategy=st, T=T, side=p["side"], token=p["token"], cond=p["cond"], price=tp, size=avail, kind="sell", cancel_at=None, filled=0.0, tp=None, placed=time.time(), taker=taker)
             self._rec(self.fo, event="placed", order_id=r["order_id"], strategy=st, T=T, side=p["side"], price=tp, size=avail, kind="sell", status=r.get("status"), taker=taker)
             log(f"[{st}] SELL limit @{tp:.2f} x{avail:.2f} order {r['order_id']}{' TAKER' if taker else ''}")
+            p["sell_fail"] = 0
         except Exception as e:
-            log(f"[{st}] SELL limit not placed ({repr(e)[:120]}); holding to settlement")
+            p["sell_fail"] = p.get("sell_fail", 0) + 1
+            if p["sell_fail"] in (1, 20): log(f"[{st}] SELL limit @{tp:.2f} not placed x{p['sell_fail']} ({repr(e)[:120]}); retried every 3 s until the close, else held to settlement")
         self._save_state()
 
     def _on_fill(self, oid, matched):
@@ -207,7 +233,7 @@ class LiveExecutor:
         if new <= 0: return
         o["filled"] = matched
         key = (o["strategy"], o["T"])
-        p = self.positions.setdefault(key, dict(side=o["side"], token=o["token"], cond=o["cond"], size=0.0, entry=o["price"], sell_orders=[], resting=0.0, settled=False, redeemed=True, sold=0.0, pnl=0.0, next_check=0.0))
+        p = self.positions.setdefault(key, dict(side=o["side"], token=o["token"], cond=o["cond"], size=0.0, entry=o["price"], sell_orders=[], resting=0.0, settled=False, redeemed=True, sold=0.0, pnl=0.0, next_check=0.0, tp=o["tp"], next_sell_try=0.0))
         p["size"] += new; fee = taker_fee(o["price"], new) if o.get("taker") else 0.0; p["pnl"] -= fee; self._book(-fee)
         self._rec(self.ft, event="fill", order_id=oid, strategy=o["strategy"], T=o["T"], side=o["side"], price=o["price"], size=new, kind="buy", fee=round(fee, 4), pnl=round(-fee, 4))
         log(f"[{o['strategy']}] FILLED {o['side']} @{o['price']:.2f} x{new:.2f} (T{time.time()-o['T']:+.1f}s)" + (f" taker fee {fee:.2f}" if fee else ""))
@@ -249,7 +275,7 @@ class LiveExecutor:
                 stop = os.path.exists(STOP_FILE)
                 for oid, o in list(self.orders.items()):
                     if DRY_RUN:
-                        st, matched = "live", o["filled"]
+                        st, matched = ("cancelled" if o.get("cancel_sent") else "live"), o["filled"]
                     else:
                         r = self._status(oid, o)
                         if r is None: 
@@ -275,6 +301,11 @@ class LiveExecutor:
                                 p = self.positions.get((o["strategy"], o["T"]))
                                 if p: p["resting"] = max(p.get("resting", 0.0) - (o["size"] - o["filled"]), 0.0)
                             del self.orders[oid]
+                # a take-profit that could not be posted (rejected, shares not settled yet, fewer than 5 shares until a later fill) or that vanished
+                # unfilled is posted again every 3 s while the window is open
+                for key, p in self.positions.items():
+                    if p["settled"] or p.get("tp") is None or now >= key[1] + 295 or now < p.get("next_sell_try", 0.0): continue
+                    if self._floor2(p["size"] - p["sold"] - p.get("resting", 0.0)) >= MIN_SHARES: p["next_sell_try"] = now + 3.0; self._post_sell(key[0], key[1], p, p["tp"])
                 # the sell limit lives only inside the window (the backtest takes no exit after the close): cancel resting sells at T+300
                 for key, p in self.positions.items():
                     if p["settled"] or now < key[1] + 300: continue
@@ -282,8 +313,9 @@ class LiveExecutor:
                         o = self.orders.get(so)
                         if o and not o.get("cancel_sent"): self._cancel(so, o, "window closed")
                 # settlement: a position still held 60 s after the close resolves to 1 or 0 (looked up every 15 s); book it, queue the redeem
+                busy = (240 <= now % 300 < 262) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
                 for key, p in list(self.positions.items()):
-                    if p["settled"] or now < key[1] + 300 + 60 or now < p.get("next_check", 0): continue
+                    if busy or p["settled"] or now < key[1] + 300 + 60 or now < p.get("next_check", 0): continue
                     p["next_check"] = now + 15.0
                     if any(so in self.orders for so in p.get("sell_orders", [])): continue      # wait until every sell is confirmed gone (a late fill is booked by the loop above)
                     out = outcome_fn(key[1])
@@ -330,8 +362,12 @@ class LiveExecutor:
     def shutdown(self):
         """On a planned stop: cancel every resting order, keep positions on disk for the next run."""
         with self.lock:
-            try: self.sdk.cancel_all(); log("shutdown: cancelled every resting order")
-            except Exception as e: log(f"shutdown cancel_all FAILED: {repr(e)[:120]}")
+            try:
+                if CANCEL_ALL: self.sdk.cancel_all(); log("shutdown: cancelled every resting order of the account")
+                else:
+                    for oid in list(self.orders): self.sdk.cancel(oid)
+                    log(f"shutdown: cancelled this bot's {len(self.orders)} resting order(s)")
+            except Exception as e: log(f"shutdown cancel FAILED: {repr(e)[:120]} - check the Polymarket UI")
             self._save_state()
 
     def summary(self):

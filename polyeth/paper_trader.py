@@ -38,13 +38,13 @@ CFG_B0 = dict(delta=0.12, cancel=10, tp=0.80, sl=0.10, tstop=240, slip=0.01, fee
 CFG_D = dict(decide=90, q=0.90, maxpx=0.90, minpx=0.80, cancel=10, tp=None, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # high-confidence settlement capture (research/ideas10.py idea 6); minpx 0.80 since 2026-11-06 (research/d_winrate.py)
 CFG_E = dict(decide=260, q=0.80, maxpx=0.90, cancel=10, tp=None, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)  # last-minute capture (research/last_minute.py): PAPER ONLY until validated live
 CAPTURE = {"D": CFG_D, "E": CFG_E}   # strategies that bid at the last print at T+decide and hold to settlement
-LIVE_STRATEGIES = {"A", "B", "D"}    # the executor places real orders only for these
+LIVE_STRATEGIES = {"A"}              # the executor places real orders only for these
 CFG_A = dict(thr=0.05, entry=0.50, tp=0.80, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # ETH 2026-11-09: sell 0.80 then settle, selected on tune (research/settle_exit_A.py, eth_A_confirm.py)
 CFG_A0 = dict(thr=0.05, entry=0.50, tp=0.85, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # BTC's live exit (0.85 then settle), kept as a shadow
 CFG_C = dict(delta=0.08, decide=-5, tp=0.80, sl=0.05, tstop=240, slip=0.01, fee=0.07)   # "B five seconds early": bid at the last print from T-5 until the open
 LAG = 30
 CFGS = {"A": CFG_A, "A0": CFG_A0, "B": CFG_B, "B0": CFG_B0, "C": CFG_C, "D": CFG_D, "E": CFG_E}
-ENABLED = {"A"}                    # ETH: B, C and D lose money on the ETH test period (polyeth/final_report_data.py); code kept, add a letter to run one
+ENABLED = set(os.environ.get("STRATEGIES", "A").split(","))   # ETH: B, C and D lose money on the ETH test period (polyeth/final_report_data.py); code kept, add a letter to run one
 
 
 def log(*a):
@@ -105,6 +105,7 @@ class LiveTimeline:
         i = sec - self.t0_epoch
         if 0 <= i < self.cap:
             self.a["e_c"][i], self.a["e_v"][i], self.a["e_bv"][i] = c, v, bv
+            if sec > getattr(self, "last_aux_sec", 0): self.last_aux_sec = sec      # second feed (the other coin's spot) freshness
 
     def finalize_to(self, sec, perp_through=None, spot_through=None):
         """Mark seconds < sec as known: forward-fill missing spot prices; a second with no perp trades while the perp feed is live
@@ -181,13 +182,14 @@ def load_archive(tl):
     tl.known = hi - lo
     # lead feed (BTC spot close / volume / taker buy volume) from the btc-predict per-second archive; the eth1 spot variant needs no perp extras
     import pandas as _pd
+    tl.aux_end = start + ((hi - lo) // DAY) * DAY      # first second not covered by the auxiliary (e_*) archive; lowered below when a day file is missing
     for i_d in range((hi - lo) // DAY):
         day = dt.datetime.fromtimestamp(start + i_d * DAY, dt.UTC).date(); j0 = i_d * DAY
         try:
             e = _pd.read_parquet(f"/home/user/btc-predict/data/sec/spot/{day}.parquet")
             tl.a["e_c"][j0:j0 + DAY] = e["c"].to_numpy(float); tl.a["e_v"][j0:j0 + DAY] = e["v"].to_numpy(float); tl.a["e_bv"][j0:j0 + DAY] = e["bv"].to_numpy(float)
         except Exception as ex:
-            log("lead-feed archive missing for", day, repr(ex)[:60])
+            log("lead-feed archive missing for", day, repr(ex)[:60]); tl.aux_end = min(tl.aux_end, start + j0)
     pc, sc = tl.a["p_close"][:tl.known], tl.a["s_close"][:tl.known]
     ok = np.isfinite(pc) & np.isfinite(sc)
     tl.basis = float(np.nanmedian(pc[ok][-DAY:] / sc[ok][-DAY:])) if ok.any() else 1.0
@@ -210,8 +212,8 @@ def backfill(tl, a_end=None):
                 log(f"backfill {sym}: {repr(ex)[:80]} - retry {k+1}")
             time.sleep(2 + 3 * k)
         raise RuntimeError(f"backfill {sym} failed at {t_from}")
-    def pull(sym, setter):
-        t = a_end; now = int(time.time()); n = 0; t_w = time.time()
+    def pull(sym, setter, t_from=None):
+        t = a_end if t_from is None else t_from; now = int(time.time()); n = 0; t_w = time.time()
         while t < now - 2:
             r = klines(sym, t)
             if not r: break
@@ -223,7 +225,7 @@ def backfill(tl, a_end=None):
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(2) as ex:
         f_spot = ex.submit(pull, "ETHUSDT", lambda k: tl.set_spot(int(k[0]) // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), float(k[7]), int(k[8]), float(k[9])))
-        f_eth = ex.submit(pull, "BTCUSDT", lambda k: tl.set_eth(int(k[0]) // 1000, float(k[4]), float(k[5]), float(k[9])))
+        f_eth = ex.submit(pull, "BTCUSDT", lambda k: tl.set_eth(int(k[0]) // 1000, float(k[4]), float(k[5]), float(k[9])), min(a_end, getattr(tl, "aux_end", a_end)))
         t = f_spot.result(); f_eth.result()
     tl.finalize_to(t)
     log(f"spot backfilled to {dt.datetime.fromtimestamp(t, dt.UTC)} (perp gap synthetic until live OKX bars arrive)")
@@ -258,7 +260,7 @@ def eth_ws(tl, stop):
 
 def okx_ws(tl, stop):
     """OKX perp trades by REST polling (the OKX websocket is reset from this network): newer-than-last-id pages."""
-    CT = 0.01  # BTC per contract
+    CT = 0.1   # ETH per contract (OKX ETH-USDT-SWAP ctVal = 0.1 ETH; BTC-USDT-SWAP is 0.01 BTC)
     last_id = None
     while not stop.is_set():
         try:
@@ -284,7 +286,7 @@ def okx_ws(tl, stop):
                         b["p_high"] = max(b["p_high"], px); b["p_low"] = min(b["p_low"], px); b["p_close"] = px
                         b["p_buy" if buy else "p_sell"] += q; b["p_ntr"] += 1; b["p_maxq"] = max(b["p_maxq"], q); b["pv"] += px * q; b["vv"] += q
                         if buy: b["p_nb"] += 1
-                        if q >= 1.0: b["p_lbv" if buy else "p_lsv"] += q
+                        if q >= 25.0: b["p_lbv" if buy else "p_lsv"] += q      # eth1 LARGE_QTY = 25 ETH (BTC bot: 1 BTC); unused by the spot variant
                     tl.last_perp_sec = max(tl.perp_pending) if tl.perp_pending else None
             time.sleep(0.4)
         except Exception as e:
@@ -309,7 +311,7 @@ def binance_perp_ws(tl, stop):
                     b["p_high"] = max(b["p_high"], px); b["p_low"] = min(b["p_low"], px); b["p_close"] = px
                     b["p_buy" if buy else "p_sell"] += q; b["p_ntr"] += 1; b["p_maxq"] = max(b["p_maxq"], q); b["pv"] += px * q; b["vv"] += q
                     if buy: b["p_nb"] += 1
-                    if q >= 1.0: b["p_lbv" if buy else "p_lsv"] += q
+                    if q >= 25.0: b["p_lbv" if buy else "p_lsv"] += q      # eth1 LARGE_QTY = 25 ETH (BTC bot: 1 BTC); unused by the spot variant
                     tl.last_perp_sec = max(tl.perp_pending) if tl.perp_pending else None
         except Exception as e:
             log("binance perp ws error", repr(e)[:120]); time.sleep(2)
@@ -341,7 +343,7 @@ def binance_perp_rest(tl, stop):
                         b["p_high"] = max(b["p_high"], px); b["p_low"] = min(b["p_low"], px); b["p_close"] = px
                         b["p_buy" if buy else "p_sell"] += q; b["p_ntr"] += 1; b["p_maxq"] = max(b["p_maxq"], q); b["pv"] += px * q; b["vv"] += q
                         if buy: b["p_nb"] += 1
-                        if q >= 1.0: b["p_lbv" if buy else "p_lsv"] += q
+                        if q >= 25.0: b["p_lbv" if buy else "p_lsv"] += q      # eth1 LARGE_QTY = 25 ETH (BTC bot: 1 BTC); unused by the spot variant
                     tl.last_perp_sec = max(tl.perp_pending) if tl.perp_pending else None
             elif isinstance(rows, dict):
                 log("binance perp rest:", str(rows)[:100]); time.sleep(5)
@@ -416,7 +418,7 @@ def get_tokens(T):
 
 def get_outcome(T):
     try:
-        e = requests.get(f"https://gamma-api.polymarket.com/events?slug=eth-updown-5m-{T}", timeout=15).json()
+        e = requests.get(f"https://gamma-api.polymarket.com/events?slug=eth-updown-5m-{T}", timeout=5).json()
         op = json.loads(e[0]["markets"][0]["outcomePrices"])
         return 1 if float(op[0]) == 1.0 else (0 if float(op[1]) == 1.0 else None)
     except Exception:
@@ -472,7 +474,7 @@ class Model:
                 for c in hm.extra: d[c] = (d[c] / d["naive_scale"]).astype(np.float32)
             hm.prepare(d)
             p_m = float(np.clip(hm.p_up(d)[0], 1e-5, 1 - 1e-5))
-            dm = self.pr.models[head]["direct"]; dfe = sorted(set(DIRECT_FEATS + list(getattr(hm, "regime", []))))
+            dm = self.pr.models[head]["direct"]; dfe = list(dm.feature_name())      # eth3 names the direct model's columns itself (same as scripts/score_m3.py)
             p_d = float(np.clip(dm.predict(d[dfe], num_iteration=dm.best_iteration)[0], 1e-5, 1 - 1e-5))
             drift_px[head] = float(d["mu"].values[0] * d["sig"].values[0])
             out[f"{head}_p"] = float(expit(0.5 * logit(p_m) + 0.5 * logit(p_d)))
@@ -500,7 +502,7 @@ class Position:
                 bb = feed.best[self.side][0]
                 px = bb if np.isfinite(bb) else (feed.last_up()[0] if self.side == "UP" else 1 - feed.last_up()[0]) - cfg["slip"]
                 return self.close(px, "TIME", int(now * 1000))
-        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30):   # resolution: 1.00 / 0.00, no fee
+        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (240 <= now % 300 < 262):   # resolution: 1.00 / 0.00, no fee
             self.last_poll = now; out = get_outcome(self.T)
             if out is not None:
                 return self.close(1.0 if (out == 1) == (self.side == "UP") else 0.0, "SETTLE", int((self.T + 300) * 1000), maker=True)
@@ -518,6 +520,10 @@ class Position:
 class Trader:
     def __init__(self):
         now = int(time.time()); t0 = (now // DAY - 10) * DAY
+        self.exec = None
+        if os.environ.get("LIVE") == "1":      # first: cancels the orders a crashed run left on the book before the 3-minute backfill
+            from live_executor import LiveExecutor
+            self.exec = LiveExecutor(); log("LIVE execution enabled" + (" (DRY_RUN)" if os.environ.get("DRY_RUN", "1") == "1" else ""))
         self.tl = LiveTimeline(t0); self.stop = threading.Event()
         backfill(self.tl)
         threading.Thread(target=spot_ws, args=(self.tl, self.stop), daemon=True).start()
@@ -535,10 +541,6 @@ class Trader:
         self.ftrade = open(os.path.join(PAPER, "paper_trades.jsonl"), "a"); self.ffc = open(os.path.join(PAPER, "forecasts.jsonl"), "a")
         self.forder = open(os.path.join(PAPER, "orders.jsonl"), "a")
         self.conds = {}
-        self.exec = None
-        if os.environ.get("LIVE") == "1":
-            from live_executor import LiveExecutor
-            self.exec = LiveExecutor(); log("LIVE execution enabled" + (" (DRY_RUN)" if os.environ.get("DRY_RUN", "1") == "1" else ""))
 
     def lat(self, scheduled, feed=None, last_sec=None):
         """Feed freshness and timing at a decision: seconds since the last received spot bar / perp trade / Polymarket print, how late
@@ -547,7 +549,8 @@ class Trader:
         now = time.time(); tl = self.tl
         d = dict(decision_delay=round(now - scheduled, 2),
                  spot_lag=round(now - (tl.last_spot_sec + 1), 2) if tl.last_spot_sec else None,
-                 perp_lag=round(now - (tl.last_perp_sec + 1), 2) if tl.last_perp_sec else None)
+                 perp_lag=round(now - (tl.last_perp_sec + 1), 2) if tl.last_perp_sec else None,
+                 aux_lag=round(now - (tl.last_aux_sec + 1), 2) if getattr(tl, "last_aux_sec", 0) else None)
         if last_sec is not None:
             i = last_sec - tl.t0_epoch
             if 0 < i < tl.cap:
@@ -605,6 +608,10 @@ class Trader:
         while True:
             try:
                 now = time.time(); T = int(now) // 300 * 300 + 300          # next nominal open
+                if self.tl.known >= self.tl.cap - 900:
+                    log("timeline capacity reached (15 days of uptime): exiting for a restart - refresh the archive (scripts/setup_box.sh) at least every two weeks")
+                    if self.exec: self.exec.shutdown()
+                    LOG.flush(); os._exit(4)
                 self.heartbeat = now
                 if now - t_start < 60:
                     self.finalize(); time.sleep(0.2); continue
@@ -614,7 +621,7 @@ class Trader:
                 # ---- regime pre-computation
                 if now >= T - 70 and (T, -45, 0) not in self.model.regime_cache and ("A_reg", T) not in self.done:
                     self.model.regime(T, -45, 0); self.done.add(("A_reg", T))
-                if now >= T - 20 and (T, -LAG, LAG) not in self.model.regime_cache and ("B_reg", T) not in self.done:
+                if "B" in ENABLED and now >= T - 20 and (T, -LAG, LAG) not in self.model.regime_cache and ("B_reg", T) not in self.done:
                     self.model.regime(T, -LAG, LAG); self.done.add(("B_reg", T))
                 if "C" in ENABLED and now >= T - 25 and (T, -LAG, LAG + CFG_C["decide"]) not in self.model.regime_cache and ("C_reg", T) not in self.done:
                     self.model.regime(T, -LAG, LAG + CFG_C["decide"]); self.done.add(("C_reg", T))
@@ -666,7 +673,9 @@ class Trader:
                     except Exception as e:
                         log("bp error", repr(e)[:200])
                 # ---- strategy A decision at T-45 (bars through T-46 final at ~T-44)
-                if now >= T - 43.5 and ("A", T) not in self.done and self.tl.known >= (T - 45) - self.tl.t0_epoch:
+                if "A" in ENABLED and now >= T - 40.5 and ("A", T) not in self.done:      # too late for this window (startup, stall, feed gap): no decision, no order
+                    self.done.add(("A", T)); log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: decision time missed (now T{now - T:+.1f}s, bars known through T{self.tl.known + self.tl.t0_epoch - T:+d}s)")
+                if "A" in ENABLED and now >= T - 43.5 and ("A", T) not in self.done and self.tl.known >= (T - 45) - self.tl.t0_epoch:
                     self.done.add(("A", T)); fc = self.model.forecast(T, -45, 0); p = fc.get("close_p", np.nan)
                     feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
                     z5 = self.bp_z.get(T, {}).get("s5", np.nan)
@@ -675,17 +684,24 @@ class Trader:
                     book_agree = bool(np.isfinite(imb) and np.sign(imb) == np.sign(p - 0.5))      # third vote (polybtc/bookdepth.py); gates only with BOOK_VOTE=1
                     plausible = bool(np.isfinite(fc.get("p0", np.nan)) and np.isfinite(p) and 0.05 < p < 0.95)
                     action = "skip" if not plausible else ("BUY " + ("UP" if p > 0.5 else "DOWN") if abs(p - 0.5) >= CFG_A["thr"] and feed is not None and agree and (book_agree or not self.book_vote) else "none")
-                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, **self.lat(T - 43.5, feed, T - 46), **fc)) + "\n"); self.ffc.flush()
+                    q = self.lat(T - 43.5, feed, T - 46); bad = []      # data-quality gate: a decision on stale or synthetic bars is not the backtested rule -> no trade
+                    if q["spot_lag"] is None or q["spot_lag"] > 3: bad.append(f"spot feed {q['spot_lag']}s old")
+                    if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} synthetic perp s in the last 60")
+                    if q.get("ffill_last60", 0) > 0: bad.append(f"{q['ffill_last60']} forward-filled spot s in the last 60")
+                    if q.get("aux_lag") is None or q["aux_lag"] > 5: bad.append(f"second feed {q.get('aux_lag')}s old")
+                    if not np.isfinite(z5): bad.append("no second-model forecast")
+                    if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
+                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
                     if not plausible:
                         log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: implausible forecast (p0={fc.get('p0')}, p={p}) - data gap?"); continue
                     log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} p_close={p:.3f} bp_z5={z5:+.3f} agree={agree} book_imb={imb:+.3f} book_agree={book_agree} market={mkt:.3f} ({fc['compute_s']}s)")
                     if action.startswith("BUY"):
                         side = action[4:]
                         self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, p, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
-                        if self.exec: self.exec.buy("A", T, side, CFG_A["entry"], T - 40, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
+                        if self.exec and "A" in LIVE_STRATEGIES: self.exec.buy("A", T, side, CFG_A["entry"], T - 40, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
                         self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T - 45) * 1000), CFG_A0, p, mkt))   # shadow with the previous exits
                 # ---- strategy B decision at T (bars through T-1 final at ~T+1.5)
-                if T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart
+                if "B" in ENABLED and T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart
                     Tb = T - 300; self.done.add(("B", Tb))
                     fc = self.model.forecast(Tb, -LAG, LAG); p = fc.get("close_p", np.nan)
                     feed = self.feed_for(Tb); mkt, mts = feed.last_up() if feed else (np.nan, None)
@@ -701,7 +717,7 @@ class Trader:
                         self.pending.append(dict(strategy="B", T=Tb, side=side, bid=bid, placed_ms=int(time.time() * 1000), until=time.time() + CFG_B["cancel"], p=p, mkt=mkt))
                         self.forder.write(json.dumps(dict(strategy="B", T=Tb, side=side, bid=bid, placed=round(time.time(), 2), placed_delay=round(time.time() - Tb, 2), event="placed")) + "\n"); self.forder.flush()
                         log(f"[B] REST BID {side} @{bid:.3f} for {CFG_B['cancel']}s")
-                        if self.exec: self.exec.buy("B", Tb, side, round(bid, 2), time.time() + CFG_B["cancel"], feed.up, feed.down, self.conds.get(Tb), CFG_B["tp"])
+                        if self.exec and "B" in LIVE_STRATEGIES: self.exec.buy("B", Tb, side, round(bid, 2), time.time() + CFG_B["cancel"], feed.up, feed.down, self.conds.get(Tb), CFG_B["tp"])
                 if self.exec: self.exec.poll(now, get_outcome)
                 # ---- pending maker orders
                 for o in list(self.pending):
