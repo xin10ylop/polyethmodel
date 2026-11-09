@@ -144,3 +144,15 @@ reports/     summary.json · trades_*.csv · B_exit_grid.csv · A_exit_grid_{tim
              eth_A_grid.csv · eth_A_confirm.csv · A_book_vote.csv
 ```
 Data lives outside git in `/home/user/data_eth` (markets, trades, days, timeline, truth, forecasts, forecasts_L0, extra).
+
+## 9. Deep dive (2026-11-09): purpose-built model and real fills on ETH
+
+Full write-up in polybtcmodel README section 10 (scripts in `polybtcmodel/research/deep/`, run with `ASSET=ETH`).
+* A model trained directly on our target (Binance TWAP60 end vs start) from the eth3 feature engine at T-45 plus book depth, on every window
+  since January 2025, walk-forward: AUC vs the Polymarket outcome **0.536** (Jun-Nov: 0.534, 0.536, 0.535, 0.531, 0.544, 0.542) against
+  0.519 for the frozen eth3 close head and 0.527 for the eth1 z. BTC cross-asset inputs add nothing (0.536).
+* The ETH market's own last price before T-45 has AUC 0.529 and is 0.67 correlated with the model: the market already knows most of it.
+* Real fills (a 0.50 bid is filled only when a taker trades against it): frozen A fills 41 % of its signals by the open; the filled trades
+  earn -1.6 cents per share and the ones that would not fill +6.7. With real fills frozen A makes -$7 a day at a $25 stake and the new model's
+  top 15 % -$11 a day; only its top 5 % is around zero. **ETH rule A is not profitable with real fills at T-45.** Earlier decision times
+  (which rescue BTC) were not built for ETH; the market is also about fifteen times thinner.
