@@ -16,7 +16,7 @@ BM_COLS = ["h10_p", "h10_pup_now", "h30_p", "h30_pup_now", "h60_p", "h60_pup_now
            "close_touch+5", "close_touch-5", "basis_dev_60", "basis_dev_300", "zfret_5", "fofi_5", "lrv_300", "K_bm", "S_bm"]
 
 def wide(prefix, cols, offs):
-    files = sorted(glob.glob(f"{os.environ.get('FORECASTS_DIR', '/home/user/data_eth/forecasts')}/{prefix}_*.parquet"))
+    files = sorted(f for d_ in os.environ.get('FORECASTS_DIR', '/home/user/data_eth/forecasts:/home/user/data_eth/forecasts_L0').split(':') for f in glob.glob(f"{d_}/{prefix}_*.parquet"))   # ETH: L=30 (TWAP, from Aug 7) and L=0 (point price, Jun 1 - Aug 6) directories
     if not files:
         return None
     fc = pd.concat([pd.read_parquet(f, columns=["T", "d"] + [c for c in cols]) for f in files], ignore_index=True)
