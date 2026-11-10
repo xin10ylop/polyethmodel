@@ -121,7 +121,7 @@ def rules(day, fcs, trades, orders):
             if r.get("rule", "old") == "new":      # the purpose-built model: trade when |score| >= threshold, side = sign of the score; the old heads are only logged
                 ns = r.get("new_score"); ns = np.nan if ns is None else ns; thr = r.get("new_thr") or np.nan
                 plausible = bool(np.isfinite(r.get("p0", np.nan) or np.nan) and np.isfinite(ns))
-                expect = bool(plausible and abs(ns) >= thr and r.get("market") is not None and np.isfinite(r.get("market") or np.nan)); side = "UP" if ns > 0 else "DOWN"
+                expect = bool(plausible and abs(ns) >= thr); side   # the last market print is only logged (thin ETH windows often have none before T-45) = "UP" if ns > 0 else "DOWN"
                 want_action = f"BUY {side}" if expect else ("none" if plausible else "skip"); p, z = ns, thr
             if r["action"] == "skip-data":         # the data-quality gate refused a signal: there must be no trade
                 res["A_gate_refused"] = res.get("A_gate_refused", 0) + 1
