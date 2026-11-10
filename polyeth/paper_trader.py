@@ -75,6 +75,7 @@ class LiveTimeline:
         self.known = 0                      # seconds [0, known) are final
         self.last_spot_sec = None; self.last_perp_sec = None   # last bar actually received from each feed
         self.last_perp_commit = None        # last second whose perp bar was committed from real trades
+        self.perp_complete = None           # REST polling only: seconds <= this have ALL their trades fetched (a second must not be committed on the clock alone: the poller may still be behind)
         self.synth = np.zeros(self.cap, dtype=bool)   # perp bar synthesized from spot (no real trades when the second was finalized)
         self.ffill = np.zeros(self.cap, dtype=bool)   # spot close forward-filled (no kline when the second was finalized)
         self.basis_live = None              # rolling perp/spot basis from real live bars (used for synthesis instead of the archive constant)
@@ -330,26 +331,30 @@ def binance_perp_rest(tl, stop):
     """Binance USDT-M perp aggTrades by REST polling (fromId pages of 1000, ~0.6 s cadence: weight 20 each, 2,400/min limit).
     Same venue and timestamps as the archive; used where the futures stream is filtered (e.g. Germany) but REST answers."""
     last_id = None; S_ = requests.Session(); st = dict(pause=0.0)
-    POLL = float(os.environ.get("PERP_POLL_S", "1.0"))      # two bots share one IP: 2 x (60 / 1.0) x weight 20 = 2,400/min is the whole limit, so the used-weight header below slows the loop as well
+    POLL = float(os.environ.get("PERP_POLL_S", "0.7"))      # two bots share one IP: 2 x (60 / 1.0) x weight 20 = 2,400/min is the whole limit, so the used-weight header below slows the loop as well
     def get(params):
         r = S_.get("https://fapi.binance.com/fapi/v1/aggTrades", params=params, timeout=10)
         used = int(r.headers.get("X-MBX-USED-WEIGHT-1M", "0") or 0)
         if r.status_code in (418, 429):      # rate limited / banned: wait as told, never hammer
             st["pause"] = float(r.headers.get("Retry-After", "30") or 30); return dict(http=r.status_code, retry_after=st["pause"], body=r.text[:80])
-        st["pause"] = 3.0 if used > 2000 else (1.0 if used > 1500 else 0.0)
+        st["pause"] = 3.0 if used > 2250 else (1.0 if used > 2000 else 0.0)      # limit 2,400/min per IP. One bot at 0.7 s uses about 1,500; TWO bots on one IP must run with PERP_POLL_S=1.4 each
         return r.json()
     while not stop.is_set():
         try:
+            t_req = time.time(); err = None; drained = False
             if last_id is None:
-                rows = get(dict(symbol="ETHUSDT", limit=1000))
+                rows = get(dict(symbol="ETHUSDT", limit=1000)); drained = isinstance(rows, list)
+                if isinstance(rows, dict): err, rows = rows, []
             else:
                 rows = []
                 for _ in range(5):
                     d = get(dict(symbol="ETHUSDT", fromId=last_id + 1, limit=1000))
-                    if isinstance(d, dict): rows = d; break          # an error answer must be logged, not swallowed
-                    if not d: break
+                    if isinstance(d, dict): err = d; break           # an error answer is logged below; the pages already fetched are kept (last_id has moved past them)
+                    if not d: drained = True; break
                     rows += d; last_id = int(d[-1]["a"])
-                    if len(d) < 1000: break
+                    if len(d) < 1000: drained = True; break
+            if drained and not rows:
+                with tl.lock: tl.perp_complete = max(tl.perp_complete or 0, int(t_req - 0.5) - 1)
             if isinstance(rows, list) and rows:
                 last_id = int(rows[-1]["a"])
                 with tl.lock:
@@ -363,8 +368,12 @@ def binance_perp_rest(tl, stop):
                         if buy: b["p_nb"] += 1
                         if q >= 25.0: b["p_lbv" if buy else "p_lsv"] += q      # eth1 LARGE_QTY = 25 ETH (BTC bot: 1 BTC); unused by the spot variant
                     tl.last_perp_sec = max(tl.perp_pending) if tl.perp_pending else None
-            elif isinstance(rows, dict):
-                log("binance perp rest:", str(rows)[:160]); time.sleep(max(5, st["pause"]))
+                    # complete through: everything before the newest trade's second, and - when this fetch emptied the queue - every second that had ended 0.5 s before the request started
+                    done = (tl.last_perp_sec - 1) if tl.last_perp_sec is not None else 0
+                    if drained: done = max(done, int(t_req - 0.5) - 1)
+                    tl.perp_complete = max(tl.perp_complete or 0, done)
+            if err is not None:
+                log("binance perp rest:", str(err)[:160]); time.sleep(max(5, st["pause"]))
             time.sleep(POLL + st["pause"])
         except Exception as e:
             log("binance perp rest error", repr(e)[:120]); time.sleep(2)
@@ -572,7 +581,7 @@ class Trader:
         from ep_live import EPLive
         self.bp = EPLive(); self.bp_z = {}      # eth1 spot variant: ETH spot + BTC spot (lead) only
         import bookdepth; self.book_vote = os.environ.get("BOOK_VOTE", "0") == "1"      # 1: the book vote gates A's trades; 0: logged only (shadow)
-        self.book = bookdepth.BookFeed(os.environ.get("BOOK_FEED", "binance_perp"), poll=5.0, record=os.path.join(PAPER, "book.jsonl"), log=log)
+        self.book = bookdepth.BookFeed(os.environ.get("BOOK_FEED", "binance_perp"), poll=5.0 if self.book_vote else 30.0, record=os.path.join(PAPER, "book.jsonl"), log=log)      # shadow logging does not need 5 s snapshots (each costs request weight on the host the backfill also uses)
         log(f"book feed {self.book.source} ({'GATES A' if self.book_vote else 'shadow: logged, not gating'})")
         self.model = Model(self.tl); self.feeds = {}; self.pending = []; self.positions = []; self.done = set()
         self.ftrade = open(os.path.join(PAPER, "paper_trades.jsonl"), "a"); self.ffc = open(os.path.join(PAPER, "forecasts.jsonl"), "a")
@@ -638,7 +647,7 @@ class Trader:
         more than GAP seconds falls back to the clock rule (and the decision record counts those seconds)."""
         now = time.time(); sec = int(now) - 1; tl = self.tl
         with tl.lock:
-            for s_ in sorted(s for s in tl.perp_pending if s < sec):
+            for s_ in sorted(s for s in tl.perp_pending if s < sec and (tl.perp_complete is None or s <= tl.perp_complete)):      # REST polling: only seconds whose trades have all been fetched
                 bb = tl.perp_pending.pop(s_); bb["p_vwap"] = bb["pv"] / bb["vv"] if bb["vv"] > 0 else bb["p_close"]; tl.set_perp(s_, bb)
             lim = sec; perp_live = tl.last_perp_commit is not None and now - (tl.last_perp_commit + 1) < self.GAP
             spot_live = tl.last_spot_sec is not None and now - (tl.last_spot_sec + 1) < self.GAP

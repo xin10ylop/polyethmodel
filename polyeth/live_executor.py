@@ -70,7 +70,14 @@ class SDK:
 
     def cancel(self, order_id):
         if DRY_RUN: return True
-        return self.client.cancel_order(order_id=order_id)
+        r = self.client.cancel_order(order_id=order_id); nc = getattr(r, "not_canceled", None) or {}
+        if order_id in nc: raise RuntimeError(f"cancel refused: {str(nc[order_id])[:80]}")      # the SDK returns refusals instead of raising: a refused cancel must be retried, not taken as done
+        return r
+
+    def open_orders(self, token_id):
+        """Ids of this account's open orders on one token (used to find an order whose placement call failed without an answer)."""
+        if DRY_RUN: return []
+        return [str(o.id) for o in self.client.list_open_orders(asset_id=token_id)]
 
     def cancel_all(self):
         if DRY_RUN: return True
@@ -192,9 +199,33 @@ class LiveExecutor:
             log(f"post-only {side} @{price:.2f} rejected ({repr(e)[:100]}); placing as a crossing limit (ALLOW_TAKER=1)")
             return self.sdk.limit(token, side, price, size, post_only=False), True
 
+    def _maybe_orphan(self, token, e, what):
+        """A placement call that failed WITHOUT a refusal from the exchange (timeout, connection error, unreadable answer) may still have
+        created the order. Such an order would rest untracked: never cancelled, never sold. Look for it a few times and cancel it."""
+        txt = (type(e).__name__ + " " + repr(e)).lower()
+        if "reject" in txt or "insufficient" in txt or "userinput" in txt: return        # the exchange (or the SDK before sending) said no: nothing was placed
+        now = time.time(); self.sweeps = getattr(self, "sweeps", []); self.sweeps.append(dict(token=token, what=what, at=[now + 1.5, now + 6.0, now + 15.0, now + 40.0]))
+        log(f"{what}: placement failed without an answer ({repr(e)[:80]}): checking the book for an untracked order")
+
+    def _sweep(self):
+        now = time.time()
+        for sw in list(getattr(self, "sweeps", [])):
+            if not sw["at"]: self.sweeps.remove(sw); continue
+            if now < sw["at"][0]: continue
+            sw["at"].pop(0)
+            try:
+                for oid in self.sdk.open_orders(sw["token"]):
+                    if oid in self.orders: continue
+                    log(f"UNTRACKED order {oid} found on the book after a failed placement ({sw['what']}): cancelling it"); self._rec(self.fo, event="orphan", order_id=oid, what=sw["what"])
+                    try: self.sdk.cancel(oid)
+                    except Exception as ce: log(f"cancel of untracked order {oid} failed: {repr(ce)[:100]} (will retry)"); sw["at"].insert(0, now + 2.0)
+            except Exception as le:
+                log(f"open-order lookup failed: {repr(le)[:100]}")
+
     def _cancel(self, oid, o, reason=""):
         """Send the cancel but keep tracking the order until the exchange confirms it is gone (cancelled or filled)."""
-        try: self.sdk.cancel(oid); o["cancel_sent"] = True
+        o["cancel_ts"] = time.time()
+        try: self.sdk.cancel(oid); o["cancel_sent"] = True; o["cancel_err"] = 0
         except Exception as e:
             o["cancel_sent"] = True; o["cancel_err"] = o.get("cancel_err", 0) + 1
             if o["cancel_err"] in (1, 5, 50): log(f"cancel {oid} failed x{o['cancel_err']} ({reason}): {repr(e)[:100]} - still tracked, will retry")
@@ -216,7 +247,7 @@ class LiveExecutor:
             try:
                 r, taker = self._place(token, "BUY", price, size)
             except Exception as e:
-                log(f"[{strategy}] BUY {side} @{price:.2f} x{size} FAILED: {repr(e)[:160]}"); return None
+                log(f"[{strategy}] BUY {side} @{price:.2f} x{size} FAILED: {repr(e)[:160]}"); self._maybe_orphan(token, e, f"{strategy} BUY {side}"); return None
             oid = r["order_id"]; self.orders[oid] = dict(strategy=strategy, T=T, side=side, token=token, cond=condition_id, price=price, size=size, kind="buy", cancel_at=cancel_at, filled=0.0, tp=tp, placed=time.time(), taker=taker)
             self._rec(self.fo, event="placed", order_id=oid, strategy=strategy, T=T, side=side, price=price, size=size, kind="buy", status=r.get("status"), taker=taker)
             log(f"[{strategy}] BUY {side} @{price:.2f} x{size} order {oid} status {r.get('status')}{' TAKER' if taker else ''}")
@@ -236,7 +267,7 @@ class LiveExecutor:
             log(f"[{st}] SELL limit @{tp:.2f} x{avail:.2f} order {r['order_id']}{' TAKER' if taker else ''}")
             p["sell_fail"] = 0
         except Exception as e:
-            p["sell_fail"] = p.get("sell_fail", 0) + 1
+            p["sell_fail"] = p.get("sell_fail", 0) + 1; self._maybe_orphan(p["token"], e, f"{st} SELL")
             if p["sell_fail"] in (1, 20): log(f"[{st}] SELL limit @{tp:.2f} not placed x{p['sell_fail']} ({repr(e)[:120]}); retried every 3 s until the close, else held to settlement")
         self._save_state()
 
@@ -284,7 +315,7 @@ class LiveExecutor:
         self._last_poll = now
         with self.lock:
             try:
-                stop = os.path.exists(STOP_FILE)
+                stop = os.path.exists(STOP_FILE); self._sweep()
                 for oid, o in list(self.orders.items()):
                     if DRY_RUN:
                         st, matched = ("cancelled" if o.get("cancel_sent") else "live"), o["filled"]
@@ -301,8 +332,8 @@ class LiveExecutor:
                             self._cancel(oid, o, "STOP" if stop else "time")
                             self._rec(self.fo, event="cancel_sent", order_id=oid, filled=o["filled"], reason="stop" if stop else "time")
                             log(f"[{o['strategy']}] cancel sent for BUY {o['side']} @{o['price']:.2f} ({o['filled']:.2f}/{o['size']:.2f} filled)" + (" (STOP)" if stop else ""))
-                        elif want_cancel and o.get("cancel_err"):
-                            self._cancel(oid, o, "retry")
+                        elif want_cancel and (o.get("cancel_err") or st == "live") and time.time() - o.get("cancel_ts", 0) > 2.0:
+                            self._cancel(oid, o, "retry")      # refused, failed, or sent but the order is still on the book 2 s later
                         if o["filled"] >= o["size"] - 1e-6 or st in ("cancelled", "canceled", "expired", "matched", "filled"):
                             if o["filled"] < o["size"] - 1e-6: self._rec(self.fo, event="cancelled", order_id=oid, filled=o["filled"]); log(f"[{o['strategy']}] BUY {o['side']} @{o['price']:.2f} gone from the book ({o['filled']:.2f}/{o['size']:.2f} filled)")
                             del self.orders[oid]
@@ -325,7 +356,7 @@ class LiveExecutor:
                         o = self.orders.get(so)
                         if o and not o.get("cancel_sent"): self._cancel(so, o, "window closed")
                 # settlement: a position still held 60 s after the close resolves to 1 or 0 (looked up every 15 s); book it, queue the redeem
-                busy = (now % 300 >= 285 + int(os.environ.get("A_DEC", "-45"))) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
+                busy = (now % 300 >= 285 + int(os.environ.get("A_DEC", "-45"))) or any(o["kind"] == "buy" for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
                 for key, p in list(self.positions.items()):
                     if busy or p["settled"] or now < key[1] + 300 + 60 or now < p.get("next_check", 0): continue
                     p["next_check"] = now + 15.0
@@ -364,6 +395,14 @@ class LiveExecutor:
                             if p["cond"] == q["cond"]: p["redeemed"] = True
                         self._save_state()
                 except Exception as e:
+                    if "no balance" in repr(e).lower():      # nothing left to redeem: Polymarket's automatic redemption (the account approves its operator) got there first
+                        log(f"redeem {q['cond'][:10]}... (window {dt.datetime.fromtimestamp(q['T'], dt.UTC):%H:%M}): already redeemed")
+                        with self.lock:
+                            self.redeem_q = [x for x in self.redeem_q if x["cond"] != q["cond"]]
+                            for k, p in self.positions.items():
+                                if p["cond"] == q["cond"]: p["redeemed"] = True
+                            self._save_state()
+                        continue
                     q["tries"] += 1; q["next"] = time.time() + min(60.0 * q["tries"], 900.0)
                     if q["tries"] in (1, 3, 10, 100): log(f"redeem {q['cond'][:10]}... failed x{q['tries']}: {repr(e)[:120]} (retrying)")
                     if q["tries"] >= 200:

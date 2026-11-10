@@ -33,15 +33,41 @@ fill at 0.50. Research on the real trade tape (`research/deep/exec_opt.py`, `can
 | + `ALLOW_TAKER=1` (take the offer when our side is already offered at <= 0.50) and `A_CANCEL_S=-15` | 21 | +2.9 | 6.0 |
 | **`A_DEC=-120`** (decide 120 s before the open, model `ourcase_BTC_d-120_live`), `ALLOW_TAKER=1`, bid kept to T-15 | 29 | +3.0 | 8.6 |
 
-**Recommended BTC setup after the policy research of 2026-11-10** (`research/deep/policy_lab.py`, `policy_grid.py`, `policy_combo.py`):
-`A_DEC=-120 NEWA_TIER=top30 A_TP=0.90 A_CANCEL_S=-15 ALLOW_TAKER=1` (the T-45 confirmation is on by default with an earlier decision).
-At $100 a trade, Jun 1 - Nov 7: 9,968 trades, win 58.9 %, +2.7 c a share, $54,271 if every trade fills the whole stake (81 % of the
-backtest table's $66,860; 95 % range $35,800 - $71,800), $22,896 when the stake is limited to the dollars that traded at our price;
-positive in each of the six months and in the three periods. What did NOT help: market orders for the signals that never fill
-(every variant lowers the total), bids above 0.50 from the start, keeping the bid past T-15.
-* `NEWA_TIER=top30`: trade the top 30 % of |score| instead of the top 15 % (twice the trades at a thinner margin).
+**Recommended BTC setup (after the audits of 2026-11-11):**
+`A_DEC=-120 NEWA_TIER=top30 A_TP=settle A_CANCEL_S=-15 ALLOW_TAKER=0 MAX_OPEN=6 DAILY_LOSS_LIMIT=-60 POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com`
+(the T-45 confirmation is on by default with an earlier decision).
+
+What to expect, BTC, $100 a trade, Jun 1 - Nov 7 (`research/deep/policy_audit.py`); the backtest table is $66,860:
+| fill rule for the resting 0.50 bid | sell 0.90 | hold to settlement |
+|---|---|---|
+| first sale at 0.50 fills us (first simulator: too generous, ignores the bids queued ahead of ours) | $54,451 (81 %) | $59,750 (89 %) |
+| filled once a print trades through 0.50 or $50 has traded at 0.50 | $26,553 - $35,894 (40 - 54 %) | **$39,738 (59 %)**, 95 % range $21,000 - $58,000 |
+| through 0.50 or $100 traded | - | $28,638 (43 %) |
+Defended estimate: 45 - 60 % of the table at small stakes, positive in the three periods; the real queue at 0.50 is unknown until real fills
+are compared with the simulated rule. At $100 a trade the volume at our price caps it further (about $11,000 - $17,000).
+
+Findings of the two independent audits (research and live code) and of the re-check, all fixed unless noted:
+* The simulator counted a fill at the first sale at 0.50 and a take-profit at the first print at 0.90: both ignore the queue. Stricter rules
+  roughly halve the 81 % first reported. Selling at 0.90 is worse than holding to settlement under every rule -> `A_TP=settle`.
+* Taking the offer when the bid would cross adds nothing ($39,738 with, $39,200 without) -> `ALLOW_TAKER=0` (no fee, no extra order path).
+* Binance REST perp feed: a second was committed on the clock while the poller could still be behind, so bars could hold only part of
+  their trades without being flagged (up to 45 % of seconds in a simulation when the poll was slowed). Now a second is committed only once all
+  its trades have been fetched (fake-exchange run: 0 % incomplete at every setting). `PERP_POLL_S` default 0.7 s for ONE bot per IP; two bots
+  on one IP must use `PERP_POLL_S=1.4` each. Pages already fetched are kept when a later page fails.
+* With `ALLOW_TAKER=1` any failed first attempt was re-sent: a timeout could have produced two orders. Only a "crosses book" refusal is re-sent.
+* A placement call that fails without an answer may have created the order: the book is now checked (1.5 / 6 / 15 / 40 s later) and an
+  untracked order is cancelled. A refused cancel (the SDK returns it instead of raising) is retried until the order is off the book.
+* Book-depth shadow feed: one snapshot every 30 s instead of 5 s, and it pauses on HTTP 429 / 418.
+* Redemption reads the chain through the SDK's default RPC, which refused the box (the approvals check failed the same way): set
+  `POLYGON_RPC_URL`. The account also approves Polymarket's automatic redemption; a win already redeemed is recognised.
+* Not fixed (monitoring only): the paper book still counts trades whose bid the confirmation cancelled; with `ALLOW_TAKER=1` the bot's own
+  fee tally is overstated for the part that fills as maker.
+* Never exercised with real money: settlement + redemption of a win, the T-120 decision, the confirmation cancel.
+
+Earlier figures in this section (the 81 % of 2026-11-10) are superseded by the table above.
+* `NEWA_TIER=top30`: trade the top 30 % of |score| instead of the top 15 % (the stored threshold selects 27 - 36 % of windows each month).
 * `A_CONFIRM=1` (default when `A_DEC` < -45): at T-43 the T-45 model scores the window again; when it points the other way the resting bid
-  is cancelled (`tests/test_confirm.py`: cancel sent exactly on disagreement, 40 windows).
+  is cancelled (`tests/test_confirm.py`).
 * `A_DEC=-120`: decision time. The earlier bid rests while fewer traders have seen the move; positive in all three periods checked
   (Jun 1 - Aug 19, Aug 20 - Sep 30, Oct 1 - Nov 7: +3.4 / +3.0 / +2.5 c a share). Live path = research path:
   `A_DEC=-120 python tests/test_newa_parity.py polybtc` (40 windows, largest score difference 0.0005). BTC only: no ETH model at T-120.

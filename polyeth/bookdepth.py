@@ -72,6 +72,8 @@ class BookFeed:
             t0 = time.time()
             try:
                 r = self.S.get(self.url, params=self.params, timeout=8)
+                if r.status_code in (418, 429):      # rate limited / banned: wait as told, never keep polling
+                    w = max(60.0, float(r.headers.get("Retry-After", "60") or 60)); self.log(f"[book] {self.source} HTTP {r.status_code}: pausing {w:.0f} s"); time.sleep(w); continue
                 if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code} {r.text[:80]}")
                 bids, asks = self.parse(r.json()); d = imbalance_from_levels(bids, asks, self.pct)
                 if d is None: raise RuntimeError("empty book")
