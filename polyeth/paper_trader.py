@@ -325,16 +325,25 @@ def binance_perp_ws(tl, stop):
 def binance_perp_rest(tl, stop):
     """Binance USDT-M perp aggTrades by REST polling (fromId pages of 1000, ~0.6 s cadence: weight 20 each, 2,400/min limit).
     Same venue and timestamps as the archive; used where the futures stream is filtered (e.g. Germany) but REST answers."""
-    last_id = None; S_ = requests.Session()
+    last_id = None; S_ = requests.Session(); st = dict(pause=0.0)
+    POLL = float(os.environ.get("PERP_POLL_S", "1.0"))      # two bots share one IP: 2 x (60 / 1.0) x weight 20 = 2,400/min is the whole limit, so the used-weight header below slows the loop as well
+    def get(params):
+        r = S_.get("https://fapi.binance.com/fapi/v1/aggTrades", params=params, timeout=10)
+        used = int(r.headers.get("X-MBX-USED-WEIGHT-1M", "0") or 0)
+        if r.status_code in (418, 429):      # rate limited / banned: wait as told, never hammer
+            st["pause"] = float(r.headers.get("Retry-After", "30") or 30); return dict(http=r.status_code, retry_after=st["pause"], body=r.text[:80])
+        st["pause"] = 3.0 if used > 2000 else (1.0 if used > 1500 else 0.0)
+        return r.json()
     while not stop.is_set():
         try:
             if last_id is None:
-                rows = S_.get("https://fapi.binance.com/fapi/v1/aggTrades", params=dict(symbol="ETHUSDT", limit=1000), timeout=10).json()
+                rows = get(dict(symbol="ETHUSDT", limit=1000))
             else:
                 rows = []
                 for _ in range(5):
-                    d = S_.get("https://fapi.binance.com/fapi/v1/aggTrades", params=dict(symbol="ETHUSDT", fromId=last_id + 1, limit=1000), timeout=10).json()
-                    if not isinstance(d, list) or not d: break
+                    d = get(dict(symbol="ETHUSDT", fromId=last_id + 1, limit=1000))
+                    if isinstance(d, dict): rows = d; break          # an error answer must be logged, not swallowed
+                    if not d: break
                     rows += d; last_id = int(d[-1]["a"])
                     if len(d) < 1000: break
             if isinstance(rows, list) and rows:
@@ -351,8 +360,8 @@ def binance_perp_rest(tl, stop):
                         if q >= 25.0: b["p_lbv" if buy else "p_lsv"] += q      # eth1 LARGE_QTY = 25 ETH (BTC bot: 1 BTC); unused by the spot variant
                     tl.last_perp_sec = max(tl.perp_pending) if tl.perp_pending else None
             elif isinstance(rows, dict):
-                log("binance perp rest:", str(rows)[:100]); time.sleep(5)
-            time.sleep(0.6)
+                log("binance perp rest:", str(rows)[:160]); time.sleep(max(5, st["pause"]))
+            time.sleep(POLL + st["pause"])
         except Exception as e:
             log("binance perp rest error", repr(e)[:120]); time.sleep(2)
 
