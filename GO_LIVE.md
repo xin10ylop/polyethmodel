@@ -33,6 +33,15 @@ fill at 0.50. Research on the real trade tape (`research/deep/exec_opt.py`, `can
 | + `ALLOW_TAKER=1` (take the offer when our side is already offered at <= 0.50) and `A_CANCEL_S=-15` | 21 | +2.9 | 6.0 |
 | **`A_DEC=-120`** (decide 120 s before the open, model `ourcase_BTC_d-120_live`), `ALLOW_TAKER=1`, bid kept to T-15 | 29 | +3.0 | 8.6 |
 
+**Recommended BTC setup after the policy research of 2026-11-10** (`research/deep/policy_lab.py`, `policy_grid.py`, `policy_combo.py`):
+`A_DEC=-120 NEWA_TIER=top30 A_TP=0.90 A_CANCEL_S=-15 ALLOW_TAKER=1` (the T-45 confirmation is on by default with an earlier decision).
+At $100 a trade, Jun 1 - Nov 7: 9,968 trades, win 58.9 %, +2.7 c a share, $54,271 if every trade fills the whole stake (81 % of the
+backtest table's $66,860; 95 % range $35,800 - $71,800), $22,896 when the stake is limited to the dollars that traded at our price;
+positive in each of the six months and in the three periods. What did NOT help: market orders for the signals that never fill
+(every variant lowers the total), bids above 0.50 from the start, keeping the bid past T-15.
+* `NEWA_TIER=top30`: trade the top 30 % of |score| instead of the top 15 % (twice the trades at a thinner margin).
+* `A_CONFIRM=1` (default when `A_DEC` < -45): at T-43 the T-45 model scores the window again; when it points the other way the resting bid
+  is cancelled (`tests/test_confirm.py`: cancel sent exactly on disagreement, 40 windows).
 * `A_DEC=-120`: decision time. The earlier bid rests while fewer traders have seen the move; positive in all three periods checked
   (Jun 1 - Aug 19, Aug 20 - Sep 30, Oct 1 - Nov 7: +3.4 / +3.0 / +2.5 c a share). Live path = research path:
   `A_DEC=-120 python tests/test_newa_parity.py polybtc` (40 windows, largest score difference 0.0005). BTC only: no ETH model at T-120.

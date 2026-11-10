@@ -551,6 +551,8 @@ class Trader:
         self.a_rule = os.environ.get("A_RULE", "new")       # "new": purpose-built model, top tier of |score| (default); "old": close head >= 0.05 + second model agrees
         assert self.a_rule in ("new", "old"), f"A_RULE must be new or old, not {self.a_rule!r}"
         assert self.a_rule == "new" or A_DEC == -45, "the old rule only exists at T-45"
+        self.a_confirm = A_DEC < -45 and os.environ.get("A_CONFIRM", "1") == "1"; self.a_side = {}      # earlier decision: at T-43 the T-45 model is asked again and the resting bid is cancelled when it points the other way
+        import newa_live; self.newa45 = NewA(path=os.path.join(newa_live.MODELS, f"ourcase_{newa_live.ASSET}_d-45_live")) if self.a_confirm else None
         self.a_cancel = min(int(os.environ.get("A_CANCEL_S", ("-30" if A_DEC == -45 else "-15") if self.a_rule == "new" else "-40")), -5)      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave about 3 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
         self.newa = NewA(); log(f"rule A: {self.a_rule}, decision at T{A_DEC}s, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.exec = None
@@ -598,6 +600,26 @@ class Trader:
             _, ts = feed.last_up(); d["pm_age"] = round(now - ts / 1000, 2) if ts else None
         if d["spot_lag"] is not None and d["spot_lag"] > 3: log(f"STALE spot feed at decision: last bar {d['spot_lag']:.1f}s old (forward-filled)")
         return d
+
+    def confirm_a(self, T, now):
+        """Earlier decision (A_DEC < -45): at T-43 score the window again with the T-45 model; when it points the other way the resting bid is
+        cancelled (a fill that already happened stays). Research: research/deep/policy_combo.py."""
+        if not self.a_confirm or T not in self.a_side or ("A_conf", T) in self.done: return None
+        if now >= T - 25: self.done.add(("A_conf", T)); return None                      # too late to matter
+        if now >= T - 52 and (T, -45, 0) not in self.model.regime_cache and ("A_conf_reg", T) not in self.done:
+            self.model.regime(T, -45, 0); self.done.add(("A_conf_reg", T))
+        ready = self.tl.known >= (T - 45) - self.tl.t0_epoch and ((self.tl.last_spot_sec or 0) >= T - 45 or now >= T - 42.0)
+        if now < T - 43.9 or not ready: return None
+        self.done.add(("A_conf", T)); side = self.a_side[T]
+        try:
+            self.model.row(T, -45, 0); i45 = (T - 45) - self.tl.t0_epoch; s45, _ = self.newa45.score(self.model.last_X, self.tl.view("s_close", i45 - 15, i45))
+        except Exception as ex:
+            s45 = np.nan; log("A confirmation error", repr(ex)[:160])
+        disagree = bool(np.isfinite(s45) and (s45 > 0) != (side == "UP"))
+        if disagree and self.exec: self.exec.cancel_now("A", T)
+        log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} T-45 model score={s45:+.4f} vs our {side}: " + ("DISAGREES -> resting bid cancelled" if disagree else "agrees, bid stays") + f" (T{time.time() - T:+.1f}s)")
+        self.ffc.write(json.dumps(dict(strategy="A_conf", T=T, ts=round(time.time(), 2), side=side, score45=s45, cancelled=disagree)) + "\n"); self.ffc.flush()
+        return disagree
 
     def feed_for(self, T):
         if T not in self.feeds:
@@ -731,7 +753,7 @@ class Trader:
                     if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} rebuilt perp s in the last 60")
                     if q.get("ffill_last60", 0) > 0: bad.append(f"{q['ffill_last60']} forward-filled spot s in the last 60")
                     def place(act, p_model):      # paper position (assumed fill) + the real order
-                        side = act[4:]
+                        side = act[4:]; self.a_side[T] = side
                         self.positions.append(Position("A", T, side, CFG_A["entry"], int((T + A_DEC) * 1000), CFG_A, p_model, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
                         if self.exec and "A" in LIVE_STRATEGIES and not self.no_live: self.exec.buy("A", T, side, CFG_A["entry"], T + self.a_cancel, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
                         elif self.exec and self.no_live: log(f"[A] real order NOT sent: {self.no_live}")
@@ -758,6 +780,7 @@ class Trader:
                         if action.startswith("BUY"): place(action, p)
                     self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, dec=A_DEC, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, open_known=open_known, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
                     log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NEW score={ns:+.4f} (trade at |score|>={self.newa.thr:.4f}) -> {action if self.a_rule == 'new' else new_action} | old rule: p_close={p:.3f} z5={z5:+.3f} agree={agree} -> {old_action} | market={mkt:.3f} ({fc.get('compute_s')}s, T{time.time() - T:+.1f}s)")
+                self.confirm_a(T, now)
                 # ---- strategy B decision at T (bars through T-1 final at ~T+1.5)
                 if "B" in ENABLED and T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart
                     Tb = T - 300; self.done.add(("B", Tb))

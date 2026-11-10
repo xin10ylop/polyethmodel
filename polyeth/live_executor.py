@@ -198,6 +198,12 @@ class LiveExecutor:
             o["cancel_sent"] = True; o["cancel_err"] = o.get("cancel_err", 0) + 1
             if o["cancel_err"] in (1, 5, 50): log(f"cancel {oid} failed x{o['cancel_err']} ({reason}): {repr(e)[:100]} - still tracked, will retry")
 
+    def cancel_now(self, strategy, T):
+        """Cancel the resting BUY of (strategy, T) at the next poll (within 0.5 s); what is already filled stays and keeps its sell order."""
+        with self.lock:
+            for o in self.orders.values():
+                if o["kind"] == "buy" and o["strategy"] == strategy and o["T"] == T and not o.get("cancel_sent"): o["cancel_at"] = time.time() - 1; self._last_poll = 0
+
     # ---------------------------------------------------------------- decisions from the paper trader
     def buy(self, strategy, T, side, price, cancel_at, token_up, token_down, condition_id, tp):
         """Rest a BUY limit for `strategy` on `side` at `price`; cancel at epoch `cancel_at` if unfilled; sell limit `tp` after the fill (None = hold)."""
