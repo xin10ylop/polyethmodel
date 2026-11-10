@@ -524,7 +524,7 @@ class Position:
                 bb = feed.best[self.side][0]
                 px = bb if np.isfinite(bb) else (feed.last_up()[0] if self.side == "UP" else 1 - feed.last_up()[0]) - cfg["slip"]
                 return self.close(px, "TIME", int(now * 1000))
-        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (240 <= now % 300 < 272):   # resolution: 1.00 / 0.00, no fee
+        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (now % 300 >= 240):   # resolution: 1.00 / 0.00, no fee
             self.last_poll = now; out = get_outcome(self.T)
             if out is not None:
                 return self.close(1.0 if (out == 1) == (self.side == "UP") else 0.0, "SETTLE", int((self.T + 300) * 1000), maker=True)

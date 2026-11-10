@@ -316,7 +316,7 @@ class LiveExecutor:
                         o = self.orders.get(so)
                         if o and not o.get("cancel_sent"): self._cancel(so, o, "window closed")
                 # settlement: a position still held 60 s after the close resolves to 1 or 0 (looked up every 15 s); book it, queue the redeem
-                busy = (240 <= now % 300 < 272) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
+                busy = (now % 300 >= 240) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
                 for key, p in list(self.positions.items()):
                     if busy or p["settled"] or now < key[1] + 300 + 60 or now < p.get("next_check", 0): continue
                     p["next_check"] = now + 15.0
