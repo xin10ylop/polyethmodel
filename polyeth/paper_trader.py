@@ -43,6 +43,8 @@ CFG_A = dict(thr=0.05, entry=0.50, tp=0.80, sl=None, tstop=None, settle=True, sl
 CFG_A0 = dict(thr=0.05, entry=0.50, tp=0.85, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # BTC's live exit (0.85 then settle), kept as a shadow
 CFG_C = dict(delta=0.08, decide=-5, tp=0.80, sl=0.05, tstop=240, slip=0.01, fee=0.07)   # "B five seconds early": bid at the last print from T-5 until the open
 LAG = 30
+PERP_CLEAN_MAX = int(os.environ.get("PERP_CLEAN_MAX", "30"))  # ... and at most this many rebuilt seconds in that horizon (a short feed hiccup must not stop trading for an hour); none at all in the last 60 s
+PERP_CLEAN_S = int(os.environ.get("PERP_CLEAN_S", "3600"))   # A trades only when no perp second in this horizon was rebuilt from spot: after a (re)start the bot waits this long (replay: scores are within 0.004 of the archive after 1 h, 0.025 after 6 min)
 CFGS = {"A": CFG_A, "A0": CFG_A0, "B": CFG_B, "B0": CFG_B0, "C": CFG_C, "D": CFG_D, "E": CFG_E}
 ENABLED = set(os.environ.get("STRATEGIES", "A").split(","))   # ETH: B, C and D lose money on the ETH test period (polyeth/final_report_data.py); code kept, add a letter to run one
 
@@ -149,6 +151,9 @@ class LiveTimeline:
         if kn < len(x):
             if k in ("s_open", "s_high", "s_low", "s_close", "p_open", "p_high", "p_low", "p_close", "p_vwap", "e_c"):
                 x[max(kn, 0):] = self.a[k][self.known - 1] if self.known > 0 else np.nan
+                if k == "s_open" and getattr(self, "last_spot_sec", None):      # the open of a second whose spot kline has arrived (the new A row's reference price)
+                    j0 = max(kn, 0); j1 = min(self.last_spot_sec + 1 - self.t0_epoch - lo, len(x))
+                    if j1 > j0: raw = self.a[k][lo + j0:lo + j1]; okr = np.isfinite(raw) & (raw > 0); x[j0:j1][okr] = raw[okr]
             else:
                 x[max(kn, 0):] = 0
         return x
@@ -439,8 +444,8 @@ class Model:
         self.regime_cache[(T, d0, e)] = R
         return R
 
-    def forecast(self, T, d0, e):
-        """Mirror of score_m2.score_points for one point, with cached regime features."""
+    def row(self, T, d0, e):
+        """The feature-engine row for one point (mirror of the batch scorer), with cached regime features; kept in last_X for the new A model."""
         t = time.time()
         R = self.regime_cache.pop((T, d0, e), None)
         if R is None: R = self.regime(T, d0, e)
@@ -457,6 +462,11 @@ class Model:
         out = {"p0": float(np.exp(aux["p0"][0])), "price_now": float(np.exp(aux["cur"][0]))}
         for k in ("seas_now", "reg_ll_beta_1h", "reg_trend_1d", "reg_catchup_1h", "lrv_300", "hod_et"):   # regime flags for prospective validation
             out[k] = float(X[k].values[0])
+        self._row = (X, base, T0, ee, e, out, t); return out
+
+    def heads(self):
+        """The five heads of the old close model on the row built by row()."""
+        X, base, T0, ee, e, out, t = self._row; out = dict(out)
         drift_px = {}
         from btcmodel.models import add_derived
         from btcmodel.predictor import HEAD_H, DIRECT_FEATS
@@ -481,6 +491,9 @@ class Model:
         out["compute_s"] = round(time.time() - t, 2)
         return out
 
+    def forecast(self, T, d0, e):
+        self.row(T, d0, e); return self.heads()
+
 
 # ------------------------------------------------------------------------------------ paper book
 class Position:
@@ -502,7 +515,7 @@ class Position:
                 bb = feed.best[self.side][0]
                 px = bb if np.isfinite(bb) else (feed.last_up()[0] if self.side == "UP" else 1 - feed.last_up()[0]) - cfg["slip"]
                 return self.close(px, "TIME", int(now * 1000))
-        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (240 <= now % 300 < 262):   # resolution: 1.00 / 0.00, no fee
+        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (240 <= now % 300 < 272):   # resolution: 1.00 / 0.00, no fee
             self.last_poll = now; out = get_outcome(self.T)
             if out is not None:
                 return self.close(1.0 if (out == 1) == (self.side == "UP") else 0.0, "SETTLE", int((self.T + 300) * 1000), maker=True)
@@ -520,6 +533,12 @@ class Position:
 class Trader:
     def __init__(self):
         now = int(time.time()); t0 = (now // DAY - 10) * DAY
+        # the rule and its model first: a missing model file or a mistyped A_RULE stops the start here, not after the backfill
+        from newa_live import NewA
+        self.a_rule = os.environ.get("A_RULE", "new")       # "new": purpose-built model, top tier of |score| (default); "old": close head >= 0.05 + second model agrees
+        assert self.a_rule in ("new", "old"), f"A_RULE must be new or old, not {self.a_rule!r}"
+        self.a_cancel = min(int(os.environ.get("A_CANCEL_S", "-30" if self.a_rule == "new" else "-40")), -5)      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave about 3 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
+        self.newa = NewA(); log(f"rule A: {self.a_rule}, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.exec = None
         if os.environ.get("LIVE") == "1":      # first: cancels the orders a crashed run left on the book before the 3-minute backfill
             from live_executor import LiveExecutor
@@ -529,6 +548,8 @@ class Trader:
         threading.Thread(target=spot_ws, args=(self.tl, self.stop), daemon=True).start()
         PERP_FEED = os.environ.get("PERP_FEED", "okx")      # 'binance' (stream), 'binance_rest' (polling, where the stream is filtered), 'okx' (lags Binance ~1 s)
         log(f"perp feed: {PERP_FEED}")
+        self.no_live = "" if (PERP_FEED.startswith("binance") or os.environ.get("ALLOW_OKX_LIVE") == "1" or os.environ.get("DRY_RUN", "1") == "1") else f"PERP_FEED={PERP_FEED} is not the model's feed (use binance_rest on a non-US host, or ALLOW_OKX_LIVE=1)"
+        if self.exec and self.no_live: log("REAL ORDERS DISABLED: " + self.no_live)
         feed_fn = {"binance": binance_perp_ws, "binance_rest": binance_perp_rest}.get(PERP_FEED, okx_ws)
         threading.Thread(target=feed_fn, args=(self.tl, self.stop), daemon=True).start()
         threading.Thread(target=eth_ws, args=(self.tl, self.stop), daemon=True).start()
@@ -537,10 +558,6 @@ class Trader:
         import bookdepth; self.book_vote = os.environ.get("BOOK_VOTE", "0") == "1"      # 1: the book vote gates A's trades; 0: logged only (shadow)
         self.book = bookdepth.BookFeed(os.environ.get("BOOK_FEED", "binance_perp"), poll=5.0, record=os.path.join(PAPER, "book.jsonl"), log=log)
         log(f"book feed {self.book.source} ({'GATES A' if self.book_vote else 'shadow: logged, not gating'})")
-        from newa_live import NewA
-        self.a_rule = os.environ.get("A_RULE", "new")       # "new": purpose-built model, top tier of |score| (default); "old": close head >= 0.05 + second model agrees
-        self.a_cancel = int(os.environ.get("A_CANCEL_S", "-30" if self.a_rule == "new" else "-40"))      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave under 2 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
-        self.newa = NewA(); log(f"rule A: {self.a_rule}, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.model = Model(self.tl); self.feeds = {}; self.pending = []; self.positions = []; self.done = set()
         self.ftrade = open(os.path.join(PAPER, "paper_trades.jsonl"), "a"); self.ffc = open(os.path.join(PAPER, "forecasts.jsonl"), "a")
         self.forder = open(os.path.join(PAPER, "orders.jsonl"), "a")
@@ -561,7 +578,7 @@ class Trader:
         if last_sec is not None:
             i = last_sec - tl.t0_epoch
             if 0 < i < tl.cap:
-                d["synth_last60"] = int(tl.synth[max(i - 59, 0):i + 1].sum()); d["ffill_last60"] = int(tl.ffill[max(i - 59, 0):i + 1].sum())
+                d["synth_last60"] = int(tl.synth[max(i - 59, 0):i + 1].sum()); d["ffill_last60"] = int(tl.ffill[max(i - 59, 0):i + 1].sum()); d["synth_clean"] = int(tl.synth[max(i - PERP_CLEAN_S + 1, 0):i + 1].sum())
                 if d["synth_last60"] or d["ffill_last60"]: log(f"decision on incomplete bars: {d['synth_last60']} synthetic perp s, {d['ffill_last60']} forward-filled spot s in the last 60 s")
         if feed is not None:
             _, ts = feed.last_up(); d["pm_age"] = round(now - ts / 1000, 2) if ts else None
@@ -626,7 +643,7 @@ class Trader:
                 for Tx in (T, T + 300):
                     if now >= Tx - 150: self.feed_for(Tx)
                 # ---- regime pre-computation
-                if now >= T - 70 and (T, -45, 0) not in self.model.regime_cache and ("A_reg", T) not in self.done:
+                if "A" in ENABLED and now >= T - 52 and (T, -45, 0) not in self.model.regime_cache and ("A_reg", T) not in self.done:
                     self.model.regime(T, -45, 0); self.done.add(("A_reg", T))
                 if "B" in ENABLED and now >= T - 20 and (T, -LAG, LAG) not in self.model.regime_cache and ("B_reg", T) not in self.done:
                     self.model.regime(T, -LAG, LAG); self.done.add(("B_reg", T))
@@ -682,39 +699,51 @@ class Trader:
                 # ---- strategy A decision at T-45 (bars through T-46 final at ~T-44)
                 if "A" in ENABLED and now >= T - 40.5 and ("A", T) not in self.done:      # decisions are made at T-43 .. T-41 only, whatever the cancel time      # too late for this window (startup, stall, feed gap): no decision, no order
                     self.done.add(("A", T)); log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: decision time missed (now T{now - T:+.1f}s, bars known through T{self.tl.known + self.tl.t0_epoch - T:+d}s)")
-                # the new model's feature row takes the open of second T-45 as its reference price (as in training): wait for that bar (final at about T-43)
-                if "A" in ENABLED and now >= T - 43.5 and ("A", T) not in self.done and self.tl.known >= (T - (44 if self.a_rule == "new" else 45)) - self.tl.t0_epoch:
-                    self.done.add(("A", T)); fc = self.model.forecast(T, -45, 0); p = fc.get("close_p", np.nan)
-                    feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
-                    z5 = self.bp_z.get(T, {}).get("s5", np.nan)
-                    agree = bool(np.isfinite(z5) and np.sign(z5) == np.sign(p - 0.5))
-                    bk = self.book.latest(max_age=120); imb = bk["imb"] if bk else np.nan; bk_age = bk["age"] if bk else None
-                    book_agree = bool(np.isfinite(imb) and np.sign(imb) == np.sign(p - 0.5))      # third vote (polybtc/bookdepth.py); gates only with BOOK_VOTE=1
-                    plausible = bool(np.isfinite(fc.get("p0", np.nan)) and np.isfinite(p) and 0.05 < p < 0.95)
-                    old_action = "skip" if not plausible else ("BUY " + ("UP" if p > 0.5 else "DOWN") if abs(p - 0.5) >= CFG_A["thr"] and feed is not None and agree and (book_agree or not self.book_vote) else "none")
+                # ---- strategy A decision.  New rule: feature row at T-45 (reference price = open of second T-45, as in training) -> score -> order,
+                #      then the old heads for the log only.  Needs bars through T-46 final and the spot kline of second T-45 (about T-43.8);
+                #      from T-42 on it decides without that open (the row then uses the last close: a small shift, flagged open_known=False).
+                a_ready = self.tl.known >= (T - 45) - self.tl.t0_epoch and (self.a_rule != "new" or (self.tl.last_spot_sec or 0) >= T - 45 or now >= T - 42.0)
+                if "A" in ENABLED and now >= T - 43.9 and ("A", T) not in self.done and a_ready:
+                    self.done.add(("A", T)); open_known = bool((self.tl.last_spot_sec or 0) >= T - 45)
+                    fc = self.model.row(T, -45, 0); feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
                     try:
                         i45 = (T - 45) - self.tl.t0_epoch; ns, nd15 = self.newa.score(self.model.last_X, self.tl.view("s_close", i45 - 15, i45))
                     except Exception as ex:
                         ns, nd15 = np.nan, np.nan; log("new A model error", repr(ex)[:160])
-                    new_action = "skip" if not (plausible and np.isfinite(ns)) else ("BUY " + ("UP" if ns > 0 else "DOWN") if abs(ns) >= self.newa.thr and feed is not None else "none")
-                    action = new_action if self.a_rule == "new" else old_action
-                    q = self.lat(T - 43.5, feed, T - (45 if self.a_rule == "new" else 46)); bad = []      # data-quality gate: a decision on stale or synthetic bars is not the backtested rule -> no trade
+                    new_action = "skip" if not (np.isfinite(fc.get("p0", np.nan)) and np.isfinite(ns)) else ("BUY " + ("UP" if ns > 0 else "DOWN") if abs(ns) >= self.newa.thr and feed is not None else "none")
+                    q = self.lat(T - 43.9, feed, T - 46); bad = []      # data-quality gate: a decision on stale or rebuilt bars is not the backtested rule -> no trade
                     if q["spot_lag"] is None or q["spot_lag"] > 3: bad.append(f"spot feed {q['spot_lag']}s old")
-                    if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} synthetic perp s in the last 60")
+                    if q.get("synth_clean", 0) > PERP_CLEAN_MAX: bad.append(f"{q['synth_clean']} rebuilt perp seconds in the last {PERP_CLEAN_S} s (start-up or feed outage; at most {PERP_CLEAN_MAX} allowed)")
+                    if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} rebuilt perp s in the last 60")
                     if q.get("ffill_last60", 0) > 0: bad.append(f"{q['ffill_last60']} forward-filled spot s in the last 60")
-                    if self.a_rule != "new":      # the old rule also needs the second model and its feed
+                    def place(act, p_model):      # paper position (assumed fill) + the real order
+                        side = act[4:]
+                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, p_model, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
+                        if self.exec and "A" in LIVE_STRATEGIES and not self.no_live: self.exec.buy("A", T, side, CFG_A["entry"], T + self.a_cancel, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
+                        elif self.exec and self.no_live: log(f"[A] real order NOT sent: {self.no_live}")
+                        self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T - 45) * 1000), CFG_A0, p_model, mkt))   # shadow with the other exit
+                    action = new_action
+                    if self.a_rule == "new":
+                        if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
+                        if action.startswith("BUY"): place(action, ns)
+                    # the old rule (close head >= 0.05 away from 0.5 and the second model agreeing): logged for comparison; it decides only with A_RULE=old
+                    try:
+                        fc = self.model.heads(); p = fc.get("close_p", np.nan)
+                    except Exception as ex:
+                        p = np.nan; log("old heads error", repr(ex)[:160])
+                    z5 = self.bp_z.get(T, {}).get("s5", np.nan); agree = bool(np.isfinite(z5) and np.isfinite(p) and np.sign(z5) == np.sign(p - 0.5))
+                    bk = self.book.latest(max_age=120); imb = bk["imb"] if bk else np.nan; bk_age = bk["age"] if bk else None
+                    book_agree = bool(np.isfinite(imb) and np.isfinite(p) and np.sign(imb) == np.sign(p - 0.5))
+                    plausible = bool(np.isfinite(fc.get("p0", np.nan)) and np.isfinite(p) and 0.05 < p < 0.95)
+                    old_action = "skip" if not plausible else ("BUY " + ("UP" if p > 0.5 else "DOWN") if abs(p - 0.5) >= CFG_A["thr"] and feed is not None and agree and (book_agree or not self.book_vote) else "none")
+                    if self.a_rule != "new":
                         if q.get("aux_lag") is None or q["aux_lag"] > 5: bad.append(f"second feed {q.get('aux_lag')}s old")
                         if not np.isfinite(z5): bad.append("no second-model forecast")
-                    if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
-                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
-                    if not plausible:
-                        log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: implausible forecast (p0={fc.get('p0')}, p={p}) - data gap?"); continue
-                    log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NEW score={ns:+.4f} (trade at |score|>={self.newa.thr:.4f}) -> {new_action} | old rule: p_close={p:.3f} z5={z5:+.3f} agree={agree} -> {old_action} | market={mkt:.3f} ({fc['compute_s']}s)")
-                    if action.startswith("BUY"):
-                        side = action[4:]
-                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, ns if self.a_rule == "new" else p, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
-                        if self.exec and "A" in LIVE_STRATEGIES: self.exec.buy("A", T, side, CFG_A["entry"], T + self.a_cancel, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
-                        self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T - 45) * 1000), CFG_A0, p, mkt))   # shadow with the previous exits
+                        action = old_action
+                        if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
+                        if action.startswith("BUY"): place(action, p)
+                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, open_known=open_known, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
+                    log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NEW score={ns:+.4f} (trade at |score|>={self.newa.thr:.4f}) -> {action if self.a_rule == 'new' else new_action} | old rule: p_close={p:.3f} z5={z5:+.3f} agree={agree} -> {old_action} | market={mkt:.3f} ({fc.get('compute_s')}s, T{time.time() - T:+.1f}s)")
                 # ---- strategy B decision at T (bars through T-1 final at ~T+1.5)
                 if "B" in ENABLED and T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart
                     Tb = T - 300; self.done.add(("B", Tb))

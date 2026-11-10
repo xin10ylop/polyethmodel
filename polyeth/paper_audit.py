@@ -118,8 +118,17 @@ def rules(day, fcs, trades, orders):
             expect = plausible and abs(p - 0.5) >= pt.CFG_A["thr"] and agree
             side = "UP" if p > 0.5 else "DOWN"
             want_action = f"BUY {side}" if expect else ("none" if plausible else "skip")
+            if r.get("rule", "old") == "new":      # the purpose-built model: trade when |score| >= threshold, side = sign of the score; the old heads are only logged
+                ns = r.get("new_score"); ns = np.nan if ns is None else ns; thr = r.get("new_thr") or np.nan
+                plausible = bool(np.isfinite(r.get("p0", np.nan) or np.nan) and np.isfinite(ns))
+                expect = bool(plausible and abs(ns) >= thr and r.get("market") is not None and np.isfinite(r.get("market") or np.nan)); side = "UP" if ns > 0 else "DOWN"
+                want_action = f"BUY {side}" if expect else ("none" if plausible else "skip"); p, z = ns, thr
+            if r["action"] == "skip-data":         # the data-quality gate refused a signal: there must be no trade
+                res["A_gate_refused"] = res.get("A_gate_refused", 0) + 1
+                if ("A", T) in tr: res["A_mismatch"].append(dict(T=T, p=round(float(p), 4), action=r["action"], want="no trade", trade=True))
+                continue
             have = ("A", T) in tr
-            if expect and not have and T + pt.CFG_A["tstop"] > time.time(): res.setdefault("A_open", []).append(T); continue   # position still open
+            if expect and not have and T + 300 > time.time(): res.setdefault("A_open", []).append(T); continue   # position still open
             if r["action"] != want_action or have != expect or (have and tr[("A", T)]["side"] != side):
                 res["A_mismatch"].append(dict(T=T, p=round(p, 3), z=round(z, 3) if np.isfinite(z) else None, action=r["action"], want=want_action, trade=have))
             res["A_expected_trades"] += int(expect)
@@ -176,6 +185,8 @@ def parity(day, fcs, sample, force_rest=False):
         return {"skipped": "archive does not cover the day"}
     from ep_live import EPLive as BPLive   # eth1 spot variant (forecast(spot, lead, t0))
     bp = BPLive(); model = pt.Model(tl)
+    from newa_live import NewA
+    newa = NewA()
     rows = []
     Ts = sorted(set(A) | set(B))[::max(1, sample)]
     t_w = time.time()
@@ -183,6 +194,11 @@ def parity(day, fcs, sample, force_rest=False):
         row = dict(T=T)
         if T in A:
             fc = model.forecast(T, -45, 0); row["A_live"] = A[T].get("close_p"); row["A_replay"] = fc.get("close_p")
+            if A[T].get("new_score") is not None:
+                try:
+                    i45 = (T - 45) - tl.t0_epoch; row["N_live"] = A[T]["new_score"]; row["N_replay"] = newa.score(model.last_X, tl.view("s_close", i45 - 15, i45))[0]; row["N_thr"] = A[T].get("new_thr")
+                except Exception as ex:
+                    row["n_err"] = repr(ex)[:80]
             if "z_s5" in A[T]:
                 try:
                     lo = (T - 60) - 60 * 2880 - 900; i0 = lo - tl.t0_epoch; i1 = (T - 60) - tl.t0_epoch
@@ -198,6 +214,11 @@ def parity(day, fcs, sample, force_rest=False):
         rows.append(row)
         if (i + 1) % 20 == 0: print(f"  replayed {i + 1}/{len(Ts)} windows ({time.time() - t_w:.0f}s)")
     df = pd.DataFrame(rows); res = {"source": src, "windows": len(df)}
+    if "N_live" in df and df.N_live.notna().any():      # the rule that trades: new-model score, live vs recomputed from the archive
+        ok = df.N_live.notna() & df.N_replay.notna(); d = (df.N_live - df.N_replay).abs()[ok]; th = df.N_thr[ok].astype(float)
+        dec = ((df.N_live[ok].abs() >= th) != (df.N_replay[ok].abs() >= th)).sum(); fl = (np.sign(df.N_live[ok]) != np.sign(df.N_replay[ok])).sum()
+        res.update(N_n=int(ok.sum()), N_mean_abs=float(d.mean()), N_max_abs=float(d.max()), N_sign_flips=int(fl), N_decisions_differ=int(dec))
+        print(f"parity NEW A score (live vs archive): {int(ok.sum())} windows, mean |diff| {d.mean():.4f}, max {d.max():.4f} (threshold {th.iloc[0]:.4f}); side flips {int(fl)}, trade decisions that differ {int(dec)}")
     for k, thr in (("A", 0.05), ("B", 0.12)):
         if f"{k}_live" not in df: continue
         d = (df[f"{k}_replay"] - df[f"{k}_live"]).abs(); ok = d.notna()

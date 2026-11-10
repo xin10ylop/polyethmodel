@@ -1,24 +1,26 @@
 # Going live with strategy A (BTC and ETH), $5 stakes, new model
 
-Audit of 2026-11-09, updated the same day for the new rule.
+Audit of 2026-11-09; the new rule was wired in and audited a second time on 2026-11-10 (findings 14-20 below).
 
 **What runs: only strategy A on both coins, with the NEW model** (README section 10; `A_RULE=new` is the default, `A_RULE=old` brings the
 previous rule back):
-* at about T-43, once the bar of second T-45 is final, the purpose-built model scores the window from the feature engine's row
+* at about T-43.8, as soon as the spot price of second T-45 has arrived, the purpose-built model scores the window from the feature engine's row
   (`polybtc/newa_live.py`, models `models/ourcase_<COIN>_d-45_live.*`, trained on every window Jan 2025 - Nov 7 2026);
 * it trades only when |score| is in its top 15 % (threshold stored with the model): score > 0 buys UP, < 0 buys DOWN;
-* BUY limit 0.50 (post-only), cancelled at T-40 if unfilled; on a fill a SELL limit rests at 0.85 on BTC / 0.80 on ETH; whatever is not
+* BUY limit 0.50 (post-only), sent right after the score, cancelled at T-30 if unfilled (`A_CANCEL_S`); on a fill a SELL limit rests at 0.85 on BTC / 0.80 on ETH; whatever is not
   sold is held to settlement and redeemed.
-The old rule (close head + second model) is still computed and written to `forecasts.jsonl` as `old_action`, for comparison only.
+The old rule (close head + second model) is computed AFTER the order has gone out and written to `forecasts.jsonl` as `old_action`, for
+comparison only: an error or a delay in the old models cannot stop or slow the new rule. `BOOK_VOTE` has no effect on the new rule.
 B, C, D and E are off and cannot place orders (`STRATEGIES=A` is the default).
 
 The live model is the research model WITHOUT the book-depth inputs: the exchange's live depth feed does not reach 1 % from the price, so
 those inputs cannot be rebuilt live. Walk-forward accuracy is nearly the same (AUC vs the Polymarket outcome, Jun-Nov: BTC 0.528 vs 0.531
 with the book, ETH 0.535 vs 0.536). Backtest of exactly this live rule, every order assumed filled at 0.50, BTC $100 + ETH $25 per trade,
 Jun 1 - Nov 7 (`research/deep/live_rule_table.py`): account $81,190 (old rule $40,015), win 66.1 % (64.1 %), max drawdown $1,780 ($3,010),
-about 43 signals a day per coin. Live path = research path: `python tests/test_newa_parity.py polybtc|polyeth` reproduces the research
-score exactly on both coins (BTC 40 windows, ETH 60 windows, max difference 0.00000; with the regime features pre-computed at T-70 as live
-does: no trade decision changes in 120 windows).
+about 43 signals a day per coin. Live path = research path: `python tests/test_newa_parity.py polybtc|polyeth` puts the trader in the
+exact state it has at the decision (bars through T-46 final, spot price of T-45 arrived, slow features computed at T-52) and compares with
+the research score: 60 windows per coin, largest difference 0.0015 (BTC) / 0.0019 (ETH) against thresholds of 0.129 / 0.140, no trade
+decision different.
 
 ## What the audit found and fixed
 | # | defect | effect if left | status |
@@ -31,11 +33,18 @@ does: no trade decision changes in 120 windows).
 | 6 | each bot's start / stop cancelled EVERY order of the wallet | the other coin's take-profit orders vanished and were never re-posted | fixed (a bot cancels only its own orders; a missing take-profit is posted again every 3 s) |
 | 7 | take-profit posted once, never retried | a rejected SELL turned the trade into hold-to-settlement | fixed |
 | 8 | SIGTERM could deadlock on the executor lock; executor was created after the 3-minute backfill | a crashed run's bid stayed on the book for minutes; unclean stops | fixed (re-entrant lock, executor first, fills made while down are recovered) |
-| 9 | slow web lookups (settlement) could delay the T-40 cancel | bid resting into the open | fixed (5 s timeout, none between T-60 and T-38, none while a bid rests) |
+| 9 | slow web lookups (settlement) could delay the cancel | bid resting into the open | fixed (5 s timeout, none between T-60 and T-28, none while a bid rests) |
 | 10 | no data-quality gate | trades on a stale spot feed, synthetic perp bars or a dead second feed | fixed (no trade, reason logged) |
 | 11 | ETH restart re-posted the take-profit at 0.85 instead of 0.80; ETH executor default log dir | wrong exit after a restart | fixed |
 | 12 | defaults were $10 stake, 4 open, -$100 daily stop | too loose for a $5 test | now $5, 3 open, -$25 per bot per day |
 | 13 | trader stops working after 15 days of uptime (timeline capacity) | silent stop | now exits and restarts; refresh the archive at least every two weeks by re-running `setup_box.sh` |
+| 14 | (2nd audit) after every start the last day or two of perp bars are rebuilt from spot, and the gate only looked at the last 60 s | first trades after a restart on inputs the model never saw (score off by up to 0.025 six minutes after a start) | fixed: no trade while more than 30 rebuilt perp seconds lie in the last hour, or any in the last minute (`PERP_CLEAN_S=3600`, `PERP_CLEAN_MAX=30`). **The bot does not trade in its first hour.** |
+| 15 | the decision waited for a perp trade in second T-45 that the model never uses | order sent 1-2 s later than needed, or the window missed on a slow perp feed | fixed: decides as soon as the spot price of T-45 is in (about T-43.8); from T-42 it decides without it and logs `open_known: false` |
+| 16 | the new rule ran inside the old model's code path | an error or an implausible value in the old heads cancelled the new rule's trade | fixed: row -> score -> gate -> order first; old heads afterwards, in their own error handler |
+| 17 | `paper_audit.py` still checked the old rule and crashed on A | daily audit useless for the live rule | fixed: checks `new_score` against `new_thr`, replays the new score from the archive |
+| 18 | settlement lookups resumed at T-38 although the bid now rests until T-30 | a slow lookup could delay the cancel | fixed: none between T-60 and T-28 |
+| 19 | real orders possible on the OKX fallback feed | live trades on inputs far from the backtest | fixed: with `DRY_RUN=0` orders are refused unless `PERP_FEED` is `binance` or `binance_rest` (`ALLOW_OKX_LIVE=1` overrides) |
+| 20 | a mistyped `A_RULE` silently ran the old rule; the model file was only loaded after the 3-minute backfill; executor defaults were $10 / 4 open / -$100 when started without `setup_box.sh` | wrong rule or wrong size without notice | fixed: start refuses any `A_RULE` other than `new` / `old`, loads the model first; defaults are $5 / 3 open / -$25 everywhere |
 
 Verified: SDK calls match `polymarket-client` 0.18.0 (pinned); 15 fake-exchange checks of the real-order path pass on both bots
 (`python tests/test_executor_fake.py polybtc|polyeth`); both bots ran here against live feeds in dry-run; ETH live-path forecasts match
@@ -43,13 +52,19 @@ the archive (30 windows: no trade-decision difference).
 
 ## What could NOT be tested here (do these on the box, in this order)
 1. **A real order has never been sent by this code.** Start with `LIVE=1 DRY_RUN=1` for an hour and read `live.log`. Then `DRY_RUN=0` and
-   watch the first three trades next to the Polymarket page: the BUY appears at 0.50 and disappears at T-40 if unfilled; after a fill a SELL
+   watch the first three trades next to the Polymarket page: the BUY appears at 0.50 about 43 s before the open and disappears 30 s before it if unfilled; after a fill a SELL
    appears at 0.85 / 0.80; after the close the position settles and, if it won, is redeemed (needs `POLYMARKET_RELAYER_API_KEY`).
 2. **Order status after a full fill.** The bot learns about fills by asking for the order's status. If the first filled BUY is not followed
    within two seconds by a "FILLED" line in `live.log`, stop (touch `$PAPER_DIR/STOP`) and send me the log.
-3. **Fill rate.** The bid now goes out at about T-42.7 (the model waits for the T-45 bar) and is cancelled at T-40: under three seconds of resting. In the trade history a 0.50 bid placed at T-45 would have filled by T-40 in about
-   28 % of BTC signals and 4 % of ETH signals, and it is refused outright when someone already offers our side at 0.50 (post-only, never a fee).
-   Expect few fills, especially on ETH. The real numbers from `live_orders.jsonl` are exactly what this test is for.
+3. **Fill rate.** The bid rests from about T-43.5 to T-30. In the trade history (a resting bid fills only when someone sells into it), a
+   0.50 bid over that stretch would have filled in 17-33 % of BTC signals (7-14 fills a day; filled trades won 63-64 %, about +4 cents a
+   share) and in 3-6 % of ETH signals (2-3 fills a day; edge about +1 cent, not distinguishable from zero). It is refused outright when
+   someone already offers our side at 0.50 (post-only, never a fee). The backtest table above assumes every order fills, so it is an upper
+   bound; the real fill rate and the result of the filled trades in `live_orders.jsonl` / `live_trades.jsonl` are what this $5 test measures.
+   The T-30 cancel was chosen on BTC evidence; for ETH there are too few fills in the history to say whether T-30 or the open is better.
+4. **Wait one hour after each start** before expecting trades (finding 14). `paper.log` shows "NO TRADE (data quality): ... rebuilt perp
+   seconds" for signals in that hour. If that line keeps appearing after the first hour, the perp feed is dropping seconds: send me
+   `forecasts.jsonl` (fields `synth_last60`, `synth_clean`, `perp_lag`).
 
 ## Commands
 ```bash
@@ -70,11 +85,12 @@ Logs per bot in its PAPER_DIR: `paper.log` (decisions), `live.log` (orders), `li
 
 ## Limits to keep in mind
 * Each bot has its own daily stop (-$25): the account can lose $50 in a day before both halt. Max 3 open positions per bot.
-* After every start the perp bars between the archive's last day and "now" are rebuilt from spot until live bars arrive; the gate only
-  checks the last 60 seconds. Start the bots right after `setup_box.sh` has fetched yesterday's archive, as the script does.
+* After every start the perp bars between the archive's last day and "now" are rebuilt from spot; the bot trades only once a full hour
+  of real perp bars has been received (after one hour its scores are within 0.004 of the archive's). The same applies after a perp-feed outage.
+* The model was trained on archives in which one day (2026-10-28) has no perp data; not corrected.
 * Positions filled between the last status check and a crash are picked up at the next start only if the state file survived.
 * **Perp feed: use `PERP_FEED=binance_rest` (or `binance`) on the non-US box**, as in the 2026-11-05 audit (Frankfurt: A forecasts within 0.006 of the
   archive, 1 decision of 127 different, 0 synthetic seconds). The default `okx` is only a fallback for US hosts: with it the forecasts are far
   from the backtest (README: direction flips on 10 of 30 windows) and the new data-quality gate will block many trades. The ETH bot's Binance
   perp handlers are the BTC ones with the symbol changed; they could not be run from this container (Binance futures refuses US hosts), so check
-  in the ETH bot's first dry-run hour that `forecasts.jsonl` shows `synth_last60: 0` and `perp_lag` under 2 s.
+  in the ETH bot's first dry-run hours that `forecasts.jsonl` shows `synth_clean: 0` from the second hour on and `perp_lag` under 2 s.

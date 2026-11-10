@@ -19,10 +19,10 @@ Everything is logged to PAPER_DIR/live_orders.jsonl and live_trades.jsonl, and l
 """
 import os, json, time, math, datetime as dt, threading, traceback
 
-STAKE_USD = float(os.environ.get("STAKE_USD", "10"))
+STAKE_USD = float(os.environ.get("STAKE_USD", "5"))
 MIN_SHARES = 5.0
-MAX_OPEN = int(os.environ.get("MAX_OPEN", "4"))
-DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "-100"))
+MAX_OPEN = int(os.environ.get("MAX_OPEN", "3"))
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "-25"))
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
 ALLOW_TAKER = os.environ.get("ALLOW_TAKER", "0") == "1"   # default: post-only everywhere, a fee can never be paid
 CANCEL_ALL = os.environ.get("CANCEL_ALL_ON_START", "0") == "1"   # 1: wipe every resting order of the account at start / stop (only when no other bot shares the wallet)
@@ -313,7 +313,7 @@ class LiveExecutor:
                         o = self.orders.get(so)
                         if o and not o.get("cancel_sent"): self._cancel(so, o, "window closed")
                 # settlement: a position still held 60 s after the close resolves to 1 or 0 (looked up every 15 s); book it, queue the redeem
-                busy = (240 <= now % 300 < 262) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
+                busy = (240 <= now % 300 < 272) or any(o["kind"] == "buy" and not o.get("cancel_sent") for o in self.orders.values())   # no slow lookups around the decision / while a bid rests
                 for key, p in list(self.positions.items()):
                     if busy or p["settled"] or now < key[1] + 300 + 60 or now < p.get("next_check", 0): continue
                     p["next_check"] = now + 15.0
