@@ -453,7 +453,7 @@ class Model:
         T0_s = np.array([Tloc + d0 - s]); T0 = (T0_s - a).astype(np.int64); ee = np.array([e], dtype=np.int64)
         X, aux = fe.compute(T0, ee)
         for k in R.columns: X[k] = R[k].values
-        X["xcur"] = aux["cur"] - aux["p0"]; X["v"] = aux["v"].astype(np.float32)
+        X["xcur"] = aux["cur"] - aux["p0"]; X["v"] = aux["v"].astype(np.float32); self.last_X = X      # the feature row, reused by the new A model
         out = {"p0": float(np.exp(aux["p0"][0])), "price_now": float(np.exp(aux["cur"][0]))}
         for k in ("seas_now", "reg_ll_beta_1h", "reg_trend_1d", "reg_catchup_1h", "lrv_300", "hod_et"):   # regime flags for prospective validation
             out[k] = float(X[k].values[0])
@@ -537,10 +537,17 @@ class Trader:
         import bookdepth; self.book_vote = os.environ.get("BOOK_VOTE", "0") == "1"      # 1: the book vote gates A's trades; 0: logged only (shadow)
         self.book = bookdepth.BookFeed(os.environ.get("BOOK_FEED", "binance_perp"), poll=5.0, record=os.path.join(PAPER, "book.jsonl"), log=log)
         log(f"book feed {self.book.source} ({'GATES A' if self.book_vote else 'shadow: logged, not gating'})")
+        from newa_live import NewA
+        self.a_rule = os.environ.get("A_RULE", "new")       # "new": purpose-built model, top tier of |score| (default); "old": close head >= 0.05 + second model agrees
+        self.a_cancel = int(os.environ.get("A_CANCEL_S", "-30" if self.a_rule == "new" else "-40"))      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave under 2 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
+        self.newa = NewA(); log(f"rule A: {self.a_rule}, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.model = Model(self.tl); self.feeds = {}; self.pending = []; self.positions = []; self.done = set()
         self.ftrade = open(os.path.join(PAPER, "paper_trades.jsonl"), "a"); self.ffc = open(os.path.join(PAPER, "forecasts.jsonl"), "a")
         self.forder = open(os.path.join(PAPER, "orders.jsonl"), "a")
         self.conds = {}
+
+    def meta_name(self):
+        return f"{self.newa.meta['asset']} d{self.newa.meta['decision_offset']} trained through {self.newa.meta['trained_through'][:10]}, {len(self.newa.feats)} features"
 
     def lat(self, scheduled, feed=None, last_sec=None):
         """Feed freshness and timing at a decision: seconds since the last received spot bar / perp trade / Polymarket print, how late
@@ -673,9 +680,10 @@ class Trader:
                     except Exception as e:
                         log("bp error", repr(e)[:200])
                 # ---- strategy A decision at T-45 (bars through T-46 final at ~T-44)
-                if "A" in ENABLED and now >= T - 40.5 and ("A", T) not in self.done:      # too late for this window (startup, stall, feed gap): no decision, no order
+                if "A" in ENABLED and now >= T - 40.5 and ("A", T) not in self.done:      # decisions are made at T-43 .. T-41 only, whatever the cancel time      # too late for this window (startup, stall, feed gap): no decision, no order
                     self.done.add(("A", T)); log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: decision time missed (now T{now - T:+.1f}s, bars known through T{self.tl.known + self.tl.t0_epoch - T:+d}s)")
-                if "A" in ENABLED and now >= T - 43.5 and ("A", T) not in self.done and self.tl.known >= (T - 45) - self.tl.t0_epoch:
+                # the new model's feature row takes the open of second T-45 as its reference price (as in training): wait for that bar (final at about T-43)
+                if "A" in ENABLED and now >= T - 43.5 and ("A", T) not in self.done and self.tl.known >= (T - (44 if self.a_rule == "new" else 45)) - self.tl.t0_epoch:
                     self.done.add(("A", T)); fc = self.model.forecast(T, -45, 0); p = fc.get("close_p", np.nan)
                     feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
                     z5 = self.bp_z.get(T, {}).get("s5", np.nan)
@@ -683,22 +691,29 @@ class Trader:
                     bk = self.book.latest(max_age=120); imb = bk["imb"] if bk else np.nan; bk_age = bk["age"] if bk else None
                     book_agree = bool(np.isfinite(imb) and np.sign(imb) == np.sign(p - 0.5))      # third vote (polybtc/bookdepth.py); gates only with BOOK_VOTE=1
                     plausible = bool(np.isfinite(fc.get("p0", np.nan)) and np.isfinite(p) and 0.05 < p < 0.95)
-                    action = "skip" if not plausible else ("BUY " + ("UP" if p > 0.5 else "DOWN") if abs(p - 0.5) >= CFG_A["thr"] and feed is not None and agree and (book_agree or not self.book_vote) else "none")
-                    q = self.lat(T - 43.5, feed, T - 46); bad = []      # data-quality gate: a decision on stale or synthetic bars is not the backtested rule -> no trade
+                    old_action = "skip" if not plausible else ("BUY " + ("UP" if p > 0.5 else "DOWN") if abs(p - 0.5) >= CFG_A["thr"] and feed is not None and agree and (book_agree or not self.book_vote) else "none")
+                    try:
+                        i45 = (T - 45) - self.tl.t0_epoch; ns, nd15 = self.newa.score(self.model.last_X, self.tl.view("s_close", i45 - 15, i45))
+                    except Exception as ex:
+                        ns, nd15 = np.nan, np.nan; log("new A model error", repr(ex)[:160])
+                    new_action = "skip" if not (plausible and np.isfinite(ns)) else ("BUY " + ("UP" if ns > 0 else "DOWN") if abs(ns) >= self.newa.thr and feed is not None else "none")
+                    action = new_action if self.a_rule == "new" else old_action
+                    q = self.lat(T - 43.5, feed, T - (45 if self.a_rule == "new" else 46)); bad = []      # data-quality gate: a decision on stale or synthetic bars is not the backtested rule -> no trade
                     if q["spot_lag"] is None or q["spot_lag"] > 3: bad.append(f"spot feed {q['spot_lag']}s old")
                     if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} synthetic perp s in the last 60")
                     if q.get("ffill_last60", 0) > 0: bad.append(f"{q['ffill_last60']} forward-filled spot s in the last 60")
-                    if q.get("aux_lag") is None or q["aux_lag"] > 5: bad.append(f"second feed {q.get('aux_lag')}s old")
-                    if not np.isfinite(z5): bad.append("no second-model forecast")
+                    if self.a_rule != "new":      # the old rule also needs the second model and its feed
+                        if q.get("aux_lag") is None or q["aux_lag"] > 5: bad.append(f"second feed {q.get('aux_lag')}s old")
+                        if not np.isfinite(z5): bad.append("no second-model forecast")
                     if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
-                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
+                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
                     if not plausible:
                         log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: implausible forecast (p0={fc.get('p0')}, p={p}) - data gap?"); continue
-                    log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} p_close={p:.3f} bp_z5={z5:+.3f} agree={agree} book_imb={imb:+.3f} book_agree={book_agree} market={mkt:.3f} ({fc['compute_s']}s)")
+                    log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NEW score={ns:+.4f} (trade at |score|>={self.newa.thr:.4f}) -> {new_action} | old rule: p_close={p:.3f} z5={z5:+.3f} agree={agree} -> {old_action} | market={mkt:.3f} ({fc['compute_s']}s)")
                     if action.startswith("BUY"):
                         side = action[4:]
-                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, p, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
-                        if self.exec and "A" in LIVE_STRATEGIES: self.exec.buy("A", T, side, CFG_A["entry"], T - 40, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
+                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, ns if self.a_rule == "new" else p, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
+                        if self.exec and "A" in LIVE_STRATEGIES: self.exec.buy("A", T, side, CFG_A["entry"], T + self.a_cancel, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
                         self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T - 45) * 1000), CFG_A0, p, mkt))   # shadow with the previous exits
                 # ---- strategy B decision at T (bars through T-1 final at ~T+1.5)
                 if "B" in ENABLED and T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart

@@ -1,9 +1,24 @@
-# Going live with strategy A (BTC and ETH), $5 stakes
+# Going live with strategy A (BTC and ETH), $5 stakes, new model
 
-Audit of 2026-11-09. What runs: only strategy A on both coins (the frozen rule: close head at T-45, |p-0.5| >= 0.05, second model agrees;
-BUY limit 0.50 placed at about T-43, cancelled at T-40 if unfilled; on a fill a SELL limit rests at 0.85 on BTC / 0.80 on ETH; whatever is
-not sold is held to settlement and redeemed). B, C, D and E are off and cannot place orders (`STRATEGIES=A` is the default).
-The purpose-built model of README section 10 is NOT wired into the live bots; this go-live is the frozen rule.
+Audit of 2026-11-09, updated the same day for the new rule.
+
+**What runs: only strategy A on both coins, with the NEW model** (README section 10; `A_RULE=new` is the default, `A_RULE=old` brings the
+previous rule back):
+* at about T-43, once the bar of second T-45 is final, the purpose-built model scores the window from the feature engine's row
+  (`polybtc/newa_live.py`, models `models/ourcase_<COIN>_d-45_live.*`, trained on every window Jan 2025 - Nov 7 2026);
+* it trades only when |score| is in its top 15 % (threshold stored with the model): score > 0 buys UP, < 0 buys DOWN;
+* BUY limit 0.50 (post-only), cancelled at T-40 if unfilled; on a fill a SELL limit rests at 0.85 on BTC / 0.80 on ETH; whatever is not
+  sold is held to settlement and redeemed.
+The old rule (close head + second model) is still computed and written to `forecasts.jsonl` as `old_action`, for comparison only.
+B, C, D and E are off and cannot place orders (`STRATEGIES=A` is the default).
+
+The live model is the research model WITHOUT the book-depth inputs: the exchange's live depth feed does not reach 1 % from the price, so
+those inputs cannot be rebuilt live. Walk-forward accuracy is nearly the same (AUC vs the Polymarket outcome, Jun-Nov: BTC 0.528 vs 0.531
+with the book, ETH 0.535 vs 0.536). Backtest of exactly this live rule, every order assumed filled at 0.50, BTC $100 + ETH $25 per trade,
+Jun 1 - Nov 7 (`research/deep/live_rule_table.py`): account $81,190 (old rule $40,015), win 66.1 % (64.1 %), max drawdown $1,780 ($3,010),
+about 43 signals a day per coin. Live path = research path: `python tests/test_newa_parity.py polybtc|polyeth` reproduces the research
+score exactly on both coins (BTC 40 windows, ETH 60 windows, max difference 0.00000; with the regime features pre-computed at T-70 as live
+does: no trade decision changes in 120 windows).
 
 ## What the audit found and fixed
 | # | defect | effect if left | status |
@@ -32,7 +47,7 @@ the archive (30 windows: no trade-decision difference).
    appears at 0.85 / 0.80; after the close the position settles and, if it won, is redeemed (needs `POLYMARKET_RELAYER_API_KEY`).
 2. **Order status after a full fill.** The bot learns about fills by asking for the order's status. If the first filled BUY is not followed
    within two seconds by a "FILLED" line in `live.log`, stop (touch `$PAPER_DIR/STOP`) and send me the log.
-3. **Fill rate.** The bid rests for about three seconds. In the trade history a 0.50 bid placed at T-45 would have filled by T-40 in about
+3. **Fill rate.** The bid now goes out at about T-42.7 (the model waits for the T-45 bar) and is cancelled at T-40: under three seconds of resting. In the trade history a 0.50 bid placed at T-45 would have filled by T-40 in about
    28 % of BTC signals and 4 % of ETH signals, and it is refused outright when someone already offers our side at 0.50 (post-only, never a fee).
    Expect few fills, especially on ETH. The real numbers from `live_orders.jsonl` are exactly what this test is for.
 
