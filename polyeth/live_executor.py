@@ -186,8 +186,9 @@ class LiveExecutor:
         try:
             return self.sdk.limit(token, side, price, size, post_only=True), False
         except Exception as e:
-            if not ALLOW_TAKER:
-                log(f"post-only {side} @{price:.2f} rejected ({repr(e)[:100]}); not placed (ALLOW_TAKER=0: never pay a fee)"); raise
+            crosses = "cross" in repr(e).lower()      # only THIS rejection may be re-sent: after a timeout or any other error the first order may exist, and a second one would double the position
+            if not ALLOW_TAKER or not crosses:
+                log(f"post-only {side} @{price:.2f} rejected ({repr(e)[:100]}); not placed" + (" (ALLOW_TAKER=0: never pay a fee)" if crosses else "")); raise
             log(f"post-only {side} @{price:.2f} rejected ({repr(e)[:100]}); placing as a crossing limit (ALLOW_TAKER=1)")
             return self.sdk.limit(token, side, price, size, post_only=False), True
 
