@@ -34,7 +34,7 @@ fill at 0.50. Research on the real trade tape (`research/deep/exec_opt.py`, `can
 | **`A_DEC=-120`** (decide 120 s before the open, model `ourcase_BTC_d-120_live`), `ALLOW_TAKER=1`, bid kept to T-15 | 29 | +3.0 | 8.6 |
 
 **Recommended BTC setup (after the audits of 2026-11-11):**
-`A_DEC=-120 NEWA_TIER=top30 A_TP=settle A_CANCEL_S=-15 ALLOW_TAKER=0 MAX_OPEN=6 DAILY_LOSS_LIMIT=-60 POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com`
+`A_DEC=-120 NEWA_TIER=top30 A_TP=settle A_CANCEL_S=-15 ALLOW_TAKER=0 A_WEEKDAY_HOURS=16-24 MAX_OPEN=6 DAILY_LOSS_LIMIT=-60 POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com`
 (the T-45 confirmation is on by default with an earlier decision).
 
 What to expect, BTC, $100 a trade, Jun 1 - Nov 7 (`research/deep/policy_audit.py`); the backtest table is $66,860:
@@ -65,6 +65,20 @@ Findings of the two independent audits (research and live code) and of the re-ch
 * Never exercised with real money: settlement + redemption of a win, the T-120 decision, the confirmation cancel.
 
 Earlier figures in this section (the 81 % of 2026-11-10) are superseded by the table above.
+
+**Trading hours** (`A_WEEKDAY_HOURS=16-24`, weekends always trade; `research/deep/policy_winrate.py`, `policy_hours.py`). With the queue-aware
+fills, the whole result of the setup comes from weekends and weekday 16-24 UTC:
+| | trades/day | win | c/share | total at $100 | max drawdown |
+|---|---|---|---|---|---|
+| every hour | 40 | 53.1 % | +3.1 | $39,200 | $2,700 |
+| weekends + weekdays 16-24 UTC | 20 | 56.1 % | +6.1 | $38,800 | $2,000 |
+| weekdays 00-16 UTC only | 20 | 50.1 % | +0.1 | $400 | - |
+The same split in the three periods: 56.2 / 55.0 / 57.2 % against 49.9 / 50.6 / 49.6 %. Independent check on the model alone (no fills),
+Oct 2025 - May 2026: weekends 55.9 % right, weekday 16-24 UTC 53.9 %, weekday 00-16 UTC 53.1 % - the weekend effect is confirmed there, the
+weekday-evening effect only weakly. This filter was found by looking at about thirty slices of the same data: treat the 56 % as an estimate
+to confirm live; the cost of being wrong is small because the excluded hours earned nothing in the sample.
+Other levers tried for the win rate, not adopted: top 5 % of signals (56.4 % but 6 trades a day, $11,600), cancelling at T-90 (54.6 %, $16,100),
+a stricter T-45 confirmation (53.5 %, same total), bids at 0.48 / 0.49 (worse), bid 0.51 (worse).
 * `NEWA_TIER=top30`: trade the top 30 % of |score| instead of the top 15 % (the stored threshold selects 27 - 36 % of windows each month).
 * `A_CONFIRM=1` (default when `A_DEC` < -45): at T-43 the T-45 model scores the window again; when it points the other way the resting bid
   is cancelled (`tests/test_confirm.py`).

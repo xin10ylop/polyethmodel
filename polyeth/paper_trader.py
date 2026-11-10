@@ -44,6 +44,13 @@ _tp = os.environ.get("A_TP", "").strip().lower()      # sell limit of A: a price
 if _tp: CFG_A["tp"] = None if _tp in ("settle", "none") else float(_tp)
 A_DEC = int(os.environ.get("A_DEC", "-45"))      # decision time of rule A, seconds from the nominal open: -45 (default), or -120 / -90 / -60 with the matching model (models/ourcase_<COIN>_d<A_DEC>_live.*)
 assert -240 <= A_DEC <= -45, "A_DEC must be between -240 and -45"
+_wh = os.environ.get("A_WEEKDAY_HOURS", "").strip()      # e.g. "16-24": on weekdays rule A trades only windows opening in these UTC hours; weekends always trade. Empty = every hour.
+A_WD_HOURS = tuple(int(x) for x in _wh.split("-")) if _wh else None
+assert A_WD_HOURS is None or (len(A_WD_HOURS) == 2 and 0 <= A_WD_HOURS[0] < A_WD_HOURS[1] <= 24), "A_WEEKDAY_HOURS must look like 16-24"
+def a_hours_ok(T):
+    """Research (research/deep/policy_hours.py): with real fills the edge sits in weekends and weekday 16-24 UTC; weekday 00-16 UTC was a coin flip."""
+    if A_WD_HOURS is None: return True
+    d = dt.datetime.fromtimestamp(T, dt.UTC); return d.weekday() >= 5 or A_WD_HOURS[0] <= d.hour < A_WD_HOURS[1]
 CFG_A0 = dict(thr=0.05, entry=0.50, tp=0.85, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # BTC's live exit (0.85 then settle), kept as a shadow
 CFG_C = dict(delta=0.08, decide=-5, tp=0.80, sl=0.05, tstop=240, slip=0.01, fee=0.07)   # "B five seconds early": bid at the last print from T-5 until the open
 LAG = 30
@@ -563,7 +570,7 @@ class Trader:
         self.a_confirm = A_DEC < -45 and os.environ.get("A_CONFIRM", "1") == "1"; self.a_side = {}      # earlier decision: at T-43 the T-45 model is asked again and the resting bid is cancelled when it points the other way
         import newa_live; self.newa45 = NewA(path=os.path.join(newa_live.MODELS, f"ourcase_{newa_live.ASSET}_d-45_live")) if self.a_confirm else None
         self.a_cancel = min(int(os.environ.get("A_CANCEL_S", ("-30" if A_DEC == -45 else "-15") if self.a_rule == "new" else "-40")), -5)      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave about 3 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
-        self.newa = NewA(); log(f"rule A: {self.a_rule}, decision at T{A_DEC}s, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
+        self.newa = NewA(); log((f"trading hours: weekdays {A_WD_HOURS[0]}-{A_WD_HOURS[1]} UTC, weekends all day" if A_WD_HOURS else "trading hours: all")); log(f"rule A: {self.a_rule}, decision at T{A_DEC}s, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.exec = None
         if os.environ.get("LIVE") == "1":      # first: cancels the orders a crashed run left on the book before the 3-minute backfill
             from live_executor import LiveExecutor
@@ -770,6 +777,7 @@ class Trader:
                     action = new_action
                     if self.a_rule == "new":
                         if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
+                        if action.startswith("BUY") and not a_hours_ok(T): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%a %H:%M} NO TRADE (outside trading hours: weekdays {A_WD_HOURS[0]}-{A_WD_HOURS[1]} UTC, weekends all day)"); action = "skip-hours"
                         if action.startswith("BUY"): place(action, ns)
                     # the old rule (close head >= 0.05 away from 0.5 and the second model agreeing): logged for comparison; it decides only with A_RULE=old
                     try:
