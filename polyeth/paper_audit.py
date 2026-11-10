@@ -193,10 +193,10 @@ def parity(day, fcs, sample, force_rest=False):
     for i, T in enumerate(Ts):
         row = dict(T=T)
         if T in A:
-            fc = model.forecast(T, -45, 0); row["A_live"] = A[T].get("close_p"); row["A_replay"] = fc.get("close_p")
+            dec = int(A[T].get("dec", -45)); fc = model.forecast(T, dec, 0); row["A_live"] = A[T].get("close_p"); row["A_replay"] = fc.get("close_p")
             if A[T].get("new_score") is not None:
                 try:
-                    i45 = (T - 45) - tl.t0_epoch; row["N_live"] = A[T]["new_score"]; row["N_replay"] = newa.score(model.last_X, tl.view("s_close", i45 - 15, i45))[0]; row["N_thr"] = A[T].get("new_thr")
+                    i45 = (T + dec) - tl.t0_epoch; row["N_live"] = A[T]["new_score"]; row["N_replay"] = newa.score(model.last_X, tl.view("s_close", i45 - 15, i45))[0]; row["N_thr"] = A[T].get("new_thr")
                 except Exception as ex:
                     row["n_err"] = repr(ex)[:80]
             if "z_s5" in A[T]:

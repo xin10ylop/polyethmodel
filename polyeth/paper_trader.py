@@ -42,6 +42,8 @@ LIVE_STRATEGIES = {"A"}              # the executor places real orders only for 
 CFG_A = dict(thr=0.05, entry=0.50, tp=0.80, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # ETH 2026-11-09: sell 0.80 then settle, selected on tune (research/settle_exit_A.py, eth_A_confirm.py)
 _tp = os.environ.get("A_TP", "").strip().lower()      # sell limit of A: a price (e.g. 0.90), or "settle" to hold every trade to settlement; default as adopted
 if _tp: CFG_A["tp"] = None if _tp in ("settle", "none") else float(_tp)
+A_DEC = int(os.environ.get("A_DEC", "-45"))      # decision time of rule A, seconds from the nominal open: -45 (default), or -120 / -90 / -60 with the matching model (models/ourcase_<COIN>_d<A_DEC>_live.*)
+assert -240 <= A_DEC <= -45, "A_DEC must be between -240 and -45"
 CFG_A0 = dict(thr=0.05, entry=0.50, tp=0.85, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # BTC's live exit (0.85 then settle), kept as a shadow
 CFG_C = dict(delta=0.08, decide=-5, tp=0.80, sl=0.05, tstop=240, slip=0.01, fee=0.07)   # "B five seconds early": bid at the last print from T-5 until the open
 LAG = 30
@@ -526,7 +528,7 @@ class Position:
                 bb = feed.best[self.side][0]
                 px = bb if np.isfinite(bb) else (feed.last_up()[0] if self.side == "UP" else 1 - feed.last_up()[0]) - cfg["slip"]
                 return self.close(px, "TIME", int(now * 1000))
-        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (now % 300 >= 240):   # resolution: 1.00 / 0.00, no fee
+        if cfg.get("settle") and now >= self.T + 300 + 20 and (self.last_poll is None or now - self.last_poll > 30) and not (now % 300 >= 285 + A_DEC):   # resolution: 1.00 / 0.00, no fee
             self.last_poll = now; out = get_outcome(self.T)
             if out is not None:
                 return self.close(1.0 if (out == 1) == (self.side == "UP") else 0.0, "SETTLE", int((self.T + 300) * 1000), maker=True)
@@ -548,8 +550,9 @@ class Trader:
         from newa_live import NewA
         self.a_rule = os.environ.get("A_RULE", "new")       # "new": purpose-built model, top tier of |score| (default); "old": close head >= 0.05 + second model agrees
         assert self.a_rule in ("new", "old"), f"A_RULE must be new or old, not {self.a_rule!r}"
-        self.a_cancel = min(int(os.environ.get("A_CANCEL_S", "-30" if self.a_rule == "new" else "-40")), -5)      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave about 3 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
-        self.newa = NewA(); log(f"rule A: {self.a_rule}, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
+        assert self.a_rule == "new" or A_DEC == -45, "the old rule only exists at T-45"
+        self.a_cancel = min(int(os.environ.get("A_CANCEL_S", ("-30" if A_DEC == -45 else "-15") if self.a_rule == "new" else "-40")), -5)      # the unfilled bid is cancelled at T+a_cancel. New rule: the bid goes out at about T-42 (it waits for the T-45 bar), so T-40 would leave about 3 s; with real fills the new model's top tier keeps its edge when the bid rests to T-30 (reports/deep_fill_sensitivity_BTC.csv)
+        self.newa = NewA(); log(f"rule A: {self.a_rule}, decision at T{A_DEC}s, unfilled bid cancelled at T{self.a_cancel}s" + (f" (model {self.meta_name()}, trade when |score| >= {self.newa.thr:.4f} = {self.newa.tier})" if self.a_rule == "new" else ""))
         self.exec = None
         if os.environ.get("LIVE") == "1":      # first: cancels the orders a crashed run left on the book before the 3-minute backfill
             from live_executor import LiveExecutor
@@ -652,10 +655,10 @@ class Trader:
                     self.finalize(); time.sleep(0.2); continue
                 self.finalize()
                 for Tx in (T, T + 300):
-                    if now >= Tx - 150: self.feed_for(Tx)
+                    if now >= Tx + A_DEC - 105: self.feed_for(Tx)
                 # ---- regime pre-computation
-                if "A" in ENABLED and now >= T - 52 and (T, -45, 0) not in self.model.regime_cache and ("A_reg", T) not in self.done:
-                    self.model.regime(T, -45, 0); self.done.add(("A_reg", T))
+                if "A" in ENABLED and now >= T + A_DEC - 7 and (T, A_DEC, 0) not in self.model.regime_cache and ("A_reg", T) not in self.done:
+                    self.model.regime(T, A_DEC, 0); self.done.add(("A_reg", T))
                 if "B" in ENABLED and now >= T - 20 and (T, -LAG, LAG) not in self.model.regime_cache and ("B_reg", T) not in self.done:
                     self.model.regime(T, -LAG, LAG); self.done.add(("B_reg", T))
                 if "C" in ENABLED and now >= T - 25 and (T, -LAG, LAG + CFG_C["decide"]) not in self.model.regime_cache and ("C_reg", T) not in self.done:
@@ -708,31 +711,31 @@ class Trader:
                     except Exception as e:
                         log("bp error", repr(e)[:200])
                 # ---- strategy A decision at T-45 (bars through T-46 final at ~T-44)
-                if "A" in ENABLED and now >= T - 40.5 and ("A", T) not in self.done:      # decisions are made at T-43 .. T-41 only, whatever the cancel time      # too late for this window (startup, stall, feed gap): no decision, no order
+                if "A" in ENABLED and now >= T + A_DEC + 4.5 and ("A", T) not in self.done:      # decisions are made at T-43 .. T-41 only, whatever the cancel time      # too late for this window (startup, stall, feed gap): no decision, no order
                     self.done.add(("A", T)); log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} SKIP: decision time missed (now T{now - T:+.1f}s, bars known through T{self.tl.known + self.tl.t0_epoch - T:+d}s)")
                 # ---- strategy A decision.  New rule: feature row at T-45 (reference price = open of second T-45, as in training) -> score -> order,
                 #      then the old heads for the log only.  Needs bars through T-46 final and the spot kline of second T-45 (about T-43.8);
                 #      from T-42 on it decides without that open (the row then uses the last close: a small shift, flagged open_known=False).
-                a_ready = self.tl.known >= (T - 45) - self.tl.t0_epoch and (self.a_rule != "new" or (self.tl.last_spot_sec or 0) >= T - 45 or now >= T - 42.0)
-                if "A" in ENABLED and now >= T - 43.9 and ("A", T) not in self.done and a_ready:
-                    self.done.add(("A", T)); open_known = bool((self.tl.last_spot_sec or 0) >= T - 45)
-                    fc = self.model.row(T, -45, 0); feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
+                a_ready = self.tl.known >= (T + A_DEC) - self.tl.t0_epoch and (self.a_rule != "new" or (self.tl.last_spot_sec or 0) >= T + A_DEC or now >= T + A_DEC + 3.0)
+                if "A" in ENABLED and now >= T + A_DEC + 1.1 and ("A", T) not in self.done and a_ready:
+                    self.done.add(("A", T)); open_known = bool((self.tl.last_spot_sec or 0) >= T + A_DEC)
+                    fc = self.model.row(T, A_DEC, 0); feed = self.feed_for(T); mkt, _ = feed.last_up() if feed else (np.nan, None)
                     try:
-                        i45 = (T - 45) - self.tl.t0_epoch; ns, nd15 = self.newa.score(self.model.last_X, self.tl.view("s_close", i45 - 15, i45))
+                        i45 = (T + A_DEC) - self.tl.t0_epoch; ns, nd15 = self.newa.score(self.model.last_X, self.tl.view("s_close", i45 - 15, i45))
                     except Exception as ex:
                         ns, nd15 = np.nan, np.nan; log("new A model error", repr(ex)[:160])
                     new_action = "skip" if not (np.isfinite(fc.get("p0", np.nan)) and np.isfinite(ns)) else ("BUY " + ("UP" if ns > 0 else "DOWN") if abs(ns) >= self.newa.thr and feed is not None else "none")
-                    q = self.lat(T - 43.9, feed, T - 46); bad = []      # data-quality gate: a decision on stale or rebuilt bars is not the backtested rule -> no trade
+                    q = self.lat(T + A_DEC + 1.1, feed, T + A_DEC - 1); bad = []      # data-quality gate: a decision on stale or rebuilt bars is not the backtested rule -> no trade
                     if q["spot_lag"] is None or q["spot_lag"] > 3: bad.append(f"spot feed {q['spot_lag']}s old")
                     if q.get("synth_clean", 0) > PERP_CLEAN_MAX: bad.append(f"{q['synth_clean']} rebuilt perp seconds in the last {PERP_CLEAN_S} s (start-up or feed outage; at most {PERP_CLEAN_MAX} allowed)")
                     if q.get("synth_last60", 0) > 0: bad.append(f"{q['synth_last60']} rebuilt perp s in the last 60")
                     if q.get("ffill_last60", 0) > 0: bad.append(f"{q['ffill_last60']} forward-filled spot s in the last 60")
                     def place(act, p_model):      # paper position (assumed fill) + the real order
                         side = act[4:]
-                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T - 45) * 1000), CFG_A, p_model, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
+                        self.positions.append(Position("A", T, side, CFG_A["entry"], int((T + A_DEC) * 1000), CFG_A, p_model, mkt)); log(f"[A] BUY {side} @0.50 (assumed pre-open fill)")
                         if self.exec and "A" in LIVE_STRATEGIES and not self.no_live: self.exec.buy("A", T, side, CFG_A["entry"], T + self.a_cancel, feed.up, feed.down, self.conds.get(T), CFG_A["tp"])
                         elif self.exec and self.no_live: log(f"[A] real order NOT sent: {self.no_live}")
-                        self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T - 45) * 1000), CFG_A0, p_model, mkt))   # shadow with the other exit
+                        self.positions.append(Position("A0", T, side, CFG_A0["entry"], int((T + A_DEC) * 1000), CFG_A0, p_model, mkt))   # shadow with the other exit
                     action = new_action
                     if self.a_rule == "new":
                         if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
@@ -753,7 +756,7 @@ class Trader:
                         action = old_action
                         if bad and action.startswith("BUY"): log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NO TRADE (data quality): " + "; ".join(bad)); action = "skip-data"
                         if action.startswith("BUY"): place(action, p)
-                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, open_known=open_known, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
+                    self.ffc.write(json.dumps(dict(strategy="A", T=T, ts=round(time.time(), 2), market=mkt, z_s5=z5, agree=agree, book_imb=imb, book_age=bk_age, book_agree=book_agree, book_gates=self.book_vote, action=action, rule=self.a_rule, dec=A_DEC, new_score=ns, new_thr=self.newa.thr, f_disp15=nd15, open_known=open_known, new_action=new_action, old_action=old_action, quality=bad, **q, **fc)) + "\n"); self.ffc.flush()
                     log(f"[A] T={dt.datetime.fromtimestamp(T, dt.UTC):%H:%M} NEW score={ns:+.4f} (trade at |score|>={self.newa.thr:.4f}) -> {action if self.a_rule == 'new' else new_action} | old rule: p_close={p:.3f} z5={z5:+.3f} agree={agree} -> {old_action} | market={mkt:.3f} ({fc.get('compute_s')}s, T{time.time() - T:+.1f}s)")
                 # ---- strategy B decision at T (bars through T-1 final at ~T+1.5)
                 if "B" in ENABLED and T - 300 + 1.6 <= now < T - 300 + 10 and ("B", T - 300) not in self.done and self.tl.known >= (T - 300) - self.tl.t0_epoch:   # skip stale windows after a restart

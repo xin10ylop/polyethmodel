@@ -22,6 +22,27 @@ exact state it has at the decision (bars through T-46 final, spot price of T-45 
 the research score: 60 windows per coin, largest difference 0.0015 (BTC) / 0.0019 (ETH) against thresholds of 0.129 / 0.140, no trade
 decision different.
 
+## Settings added on 2026-11-10 after the first real trades (all optional; defaults unchanged)
+The first real BTC orders (bid placed, cancelled, filled, sold at 0.85 with no fee) showed what the backtest table cannot: most signals never
+fill at 0.50. Research on the real trade tape (`research/deep/exec_opt.py`, `cancel_late.py`, `tp_entry.py`, `early_decision.py`,
+`trades_per_day.py`, `max_stake.py`), BTC, Jun 1 - Nov 7, $5 stake; "every signal filled at 0.50" = $21 a day:
+
+| setup | trades/day | c/share | $/day at $5 |
+|---|---|---|---|
+| decision T-45, bid 0.50 to T-30, never a fee (the default) | 8.5 | +3.7 | 3.2 |
+| + `ALLOW_TAKER=1` (take the offer when our side is already offered at <= 0.50) and `A_CANCEL_S=-15` | 21 | +2.9 | 6.0 |
+| **`A_DEC=-120`** (decide 120 s before the open, model `ourcase_BTC_d-120_live`), `ALLOW_TAKER=1`, bid kept to T-15 | 29 | +3.0 | 8.6 |
+
+* `A_DEC=-120`: decision time. The earlier bid rests while fewer traders have seen the move; positive in all three periods checked
+  (Jun 1 - Aug 19, Aug 20 - Sep 30, Oct 1 - Nov 7: +3.4 / +3.0 / +2.5 c a share). Live path = research path:
+  `A_DEC=-120 python tests/test_newa_parity.py polybtc` (40 windows, largest score difference 0.0005). BTC only: no ETH model at T-120.
+* `A_CANCEL_S`: when the unfilled bid is cancelled (default T-30 at T-45, T-15 at earlier decisions). Keeping the bid past T-15, to the
+  open or after it, adds trades with about no edge.
+* `ALLOW_TAKER=1`: a bid refused as "crosses the book" is sent again as a plain limit at 0.50: it fills at 0.50 or better and pays the
+  taker fee (about 1.75 c a share). Never more than 0.50.
+* `A_TP=0.90` or `A_TP=settle`: sell price. 0.90 adds 0.1-0.2 c a share; holding to settlement about 0.7 c with larger swings.
+* Stake: the volume sold at 0.50 while the bid rests caps the useful size at about $200 a trade on BTC (`max_stake.py`).
+
 ## What the audit found and fixed
 | # | defect | effect if left | status |
 |---|---|---|---|

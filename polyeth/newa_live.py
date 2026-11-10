@@ -18,7 +18,7 @@ def disp15(s_close_last60):
 
 class NewA:
     def __init__(self, tier=None, path=None):
-        base = path or os.path.join(MODELS, f"ourcase_{ASSET}_d-45_live"); self.meta = json.load(open(base + ".json")); self.booster = lgb.Booster(model_file=base + ".txt")
+        base = path or os.path.join(MODELS, f"ourcase_{ASSET}_d{int(os.environ.get('A_DEC', '-45'))}_live"); self.meta = json.load(open(base + ".json")); self.booster = lgb.Booster(model_file=base + ".txt")
         self.feats = self.meta["features"]; self.tier = tier or os.environ.get("NEWA_TIER", "top15"); self.thr = float(self.meta["tier_abs_score"][self.tier])
 
     def score(self, X, s_close_last60):
