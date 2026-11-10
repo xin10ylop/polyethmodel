@@ -40,6 +40,8 @@ CFG_E = dict(decide=260, q=0.80, maxpx=0.90, cancel=10, tp=None, sl=None, tstop=
 CAPTURE = {"D": CFG_D, "E": CFG_E}   # strategies that bid at the last print at T+decide and hold to settlement
 LIVE_STRATEGIES = {"A"}              # the executor places real orders only for these
 CFG_A = dict(thr=0.05, entry=0.50, tp=0.80, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # ETH 2026-11-09: sell 0.80 then settle, selected on tune (research/settle_exit_A.py, eth_A_confirm.py)
+_tp = os.environ.get("A_TP", "").strip().lower()      # sell limit of A: a price (e.g. 0.90), or "settle" to hold every trade to settlement; default as adopted
+if _tp: CFG_A["tp"] = None if _tp in ("settle", "none") else float(_tp)
 CFG_A0 = dict(thr=0.05, entry=0.50, tp=0.85, sl=None, tstop=None, settle=True, slip=0.01, fee=0.07)   # BTC's live exit (0.85 then settle), kept as a shadow
 CFG_C = dict(delta=0.08, decide=-5, tp=0.80, sl=0.05, tstop=240, slip=0.01, fee=0.07)   # "B five seconds early": bid at the last print from T-5 until the open
 LAG = 30

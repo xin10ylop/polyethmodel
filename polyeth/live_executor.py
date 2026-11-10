@@ -29,6 +29,8 @@ CANCEL_ALL = os.environ.get("CANCEL_ALL_ON_START", "0") == "1"   # 1: wipe every
 PAPER = os.environ.get("PAPER_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "paper_eth")
 STOP_FILE = os.path.join(PAPER, "STOP")
 CFG_TP = {"A": 0.80, "B": 0.85, "D": None}   # sell limit per strategy (mirrors paper_trader CFG_*; used only when re-posting after a restart)
+_tp = os.environ.get("A_TP", "").strip().lower()
+if _tp: CFG_TP["A"] = None if _tp in ("settle", "none") else float(_tp)
 LOG = open(os.path.join(PAPER, "live.log"), "a")
 
 
