@@ -52,10 +52,13 @@ class SDK:
         kw = dict(private_key=os.environ["POLYMARKET_PRIVATE_KEY"], wallet=os.environ["POLYMARKET_WALLET_ADDRESS"])
         if os.environ.get("POLYMARKET_RELAYER_API_KEY"):
             kw["api_key"] = RelayerApiKey(key=os.environ["POLYMARKET_RELAYER_API_KEY"], address=os.environ["POLYMARKET_RELAYER_API_KEY_ADDRESS"])
+        if os.environ.get("POLYGON_RPC_URL"):      # the SDK's default Polygon RPC refuses some hosts: optional replacement (used for reading approvals / chain state)
+            import dataclasses; from polymarket._internal.environment import PRODUCTION_CONFIG, with_environment_config; from polymarket import PRODUCTION
+            kw["environment"] = with_environment_config(PRODUCTION, config=dataclasses.replace(PRODUCTION_CONFIG, rpc_url=os.environ["POLYGON_RPC_URL"]))
         self.client = SecureClient.create(**kw)
         log("sdk ready: wallet", os.environ["POLYMARKET_WALLET_ADDRESS"], "type", getattr(self.client, "wallet_type", "?"))
         try: self.client.setup_trading_approvals(); log("trading approvals ok (pUSD + outcome tokens)")
-        except Exception as e: log("setup_trading_approvals:", repr(e)[:160])
+        except Exception as e: log("setup_trading_approvals:", repr(e)[:160], "| the approvals could not be read from the chain (RPC refused): harmless if the account already has them; else set POLYGON_RPC_URL")
 
     def limit(self, token_id, side, price, size, post_only=False):
         if DRY_RUN: return dict(order_id=f"dry-{int(time.time()*1000)}", status="live")
