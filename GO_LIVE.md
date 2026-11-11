@@ -77,6 +77,12 @@ The same split in the three periods: 56.2 / 55.0 / 57.2 % against 49.9 / 50.6 / 
 Oct 2025 - May 2026: weekends 55.9 % right, weekday 16-24 UTC 53.9 %, weekday 00-16 UTC 53.1 % - the weekend effect is confirmed there, the
 weekday-evening effect only weakly. This filter was found by looking at about thirty slices of the same data: treat the 56 % as an estimate
 to confirm live; the cost of being wrong is small because the excluded hours earned nothing in the sample.
+Deeper check (`research/deep/policy_hours2.py`): on the model's raw accuracy over all 14 walk-forward months, weekends beat weekday
+00-16 UTC in 14 months of 14 (56.1 % against 52.6 %, ranges that do not overlap), weekday 16-24 UTC in 10 of 14 (54.6 %); the same order in
+the T-45 model and in the ETH model; it is not volatility or volume (the order holds inside each tercile). With fills, the trades that fill in
+the good hours win as often as those that do not (56.0 % / 55.6 %): no adverse selection there, while on weekday daytime the filled ones are
+worse (50.1 % against 52.1 %). The line is not knife-edge (weekday start at 14, 16 or 18 UTC: $40.3k / $38.8k / $36.1k). Inside the good
+hours a stronger signal pays (top 15 %: 59.1 % win, $26.3k; top 30 %: 56.1 %, $38.8k; top 50 %: 54.0 %, $45.8k); on weekday daytime it does not.
 Other levers tried for the win rate, not adopted: top 5 % of signals (56.4 % but 6 trades a day, $11,600), cancelling at T-90 (54.6 %, $16,100),
 a stricter T-45 confirmation (53.5 %, same total), bids at 0.48 / 0.49 (worse), bid 0.51 (worse).
 * `NEWA_TIER=top30`: trade the top 30 % of |score| instead of the top 15 % (the stored threshold selects 27 - 36 % of windows each month).
